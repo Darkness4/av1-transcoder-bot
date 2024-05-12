@@ -44,6 +44,6 @@ pub fn probe(files: []const [*:0]const u8, quiet: bool) !void {
 
 fn print_error(prefix: []const u8, err: c_int) void {
     var buf = [_]u8{0} ** c.AV_ERROR_MAX_STRING_SIZE;
-    _ = c.av_make_error_string(@constCast(@ptrCast(&buf)), c.AV_ERROR_MAX_STRING_SIZE, err);
+    _ = c.av_make_error_string(&buf, c.AV_ERROR_MAX_STRING_SIZE, err);
     std.debug.print("{s} error: {s}\n", .{ prefix, buf });
 }
