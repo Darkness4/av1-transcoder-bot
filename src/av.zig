@@ -176,7 +176,6 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, audio_on
                 // Set to zero
                 prev_duration[i] = 0;
                 dts_offset[i] = 0;
-                // TODO: check out of bounds
                 prev_dts.items[input_idx][i] = c.AV_NOPTS_VALUE;
                 prev_pts.items[input_idx][i] = c.AV_NOPTS_VALUE;
             }
@@ -194,7 +193,7 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, audio_on
                     return error.AVError;
                 }
             }
-            // TODO: close avio file
+            // Note: checks for avio_close is above.
 
             // Set "faststart" option
             ret = c.av_dict_set(&opts, "movflags", "faststart", 0);
@@ -202,6 +201,7 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, audio_on
                 err.print("av_dict_set", ret);
                 return error.AVError;
             }
+            // Note: checks for dict_free is above.
 
             // Write header
             ret = c.avformat_write_header(optional_ofmt_ctx, &opts);
