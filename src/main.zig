@@ -1,7 +1,23 @@
 const std = @import("std");
-const probe = @import("probe.zig");
+const av = @import("av.zig");
 
 pub fn main() !void {
-    const files: []const [*:0]const u8 = &.{"test.mp4"};
-    try probe.probe(files, false);
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+
+    var args = std.ArrayList([*:0]const u8).init(allocator);
+    defer args.deinit();
+
+    var it = try std.process.argsWithAllocator(allocator);
+    defer it.deinit();
+
+    _ = it.next(); // skip the program name
+    while (it.next()) |arg| {
+        try args.append(arg.ptr);
+    }
+
+    av.concat("out.mp4", args.items, false) catch |err| switch (err) {
+        error.AVError => {},
+        else => return err,
+    };
 }
