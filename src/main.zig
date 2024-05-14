@@ -18,7 +18,10 @@ pub fn main() !void {
         try args.append(arg.ptr);
     }
 
-    av.concat("out.mp4", args.items, false) catch |err| switch (err) {
+    av.concat("out.mp4", args.items, .{
+        .audio_only = false,
+        .to_av1 = false,
+    }) catch |err| switch (err) {
         error.AVError => {},
         else => return err,
     };
