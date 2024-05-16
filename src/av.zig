@@ -67,8 +67,7 @@ const Transcoder = struct {
     }
 
     fn prepare_encoder(self: *Transcoder, ofmt_ctx: *const c.AVFormatContext) !*c.AVCodecContext {
-        const enc = c.avcodec_find_encoder(self.dec_ctx.?.*.codec_id);
-        //const enc = c.avcodec_find_encoder(c.AV_CODEC_ID_AV1);
+        const enc = c.avcodec_find_encoder(c.AV_CODEC_ID_AV1);
         if (enc == null) {
             std.debug.print("couldn't find encoder\n", .{});
             return error.AVError;
@@ -592,8 +591,6 @@ const StreamContext = struct {
     }
 
     fn fix_ts(self: StreamContext, pkt: *c.AVPacket) !void {
-        // std.debug.print("Before Input {}, stream #{} ({s}) pkt.pts={}, pkt.dts={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.in_stream.*.codecpar.*.codec_type), pkt.pts, pkt.dts });
-
         // Add past offsets.
         var delta: i64 = self.dts_offset.*;
 
@@ -605,7 +602,7 @@ const StreamContext = struct {
             if (self.previous_input_dts != null and self.previous_input_dts.?.* != c.AV_NOPTS_VALUE) {
                 delta += self.previous_input_dts.?.* + self.previous_input_duration.?.*;
 
-                std.debug.print("Input {}, stream #{} ({s}) concatenation, last.dts={}, pkt.dts{}, new offset={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.in_stream.*.codecpar.*.codec_type), self.previous_input_dts.?.*, pkt.dts, delta });
+                std.debug.print("Input {}, stream #{} ({s}) concatenation, last.dts={}, pkt.dts={}, new offset={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.in_stream.*.codecpar.*.codec_type), self.previous_input_dts.?.*, pkt.dts, delta });
                 self.previous_dts.* = self.previous_input_dts.?.*;
                 self.previous_duration.* = self.previous_input_duration.?.*;
             }
@@ -617,7 +614,8 @@ const StreamContext = struct {
             self.previous_dts.* >= pkt.dts + delta)
         {
             // Offset because of discontinuity
-            delta += self.previous_dts.* + self.previous_duration.* - pkt.dts - delta;
+            delta = self.previous_dts.* - pkt.dts;
+            delta += if (self.previous_duration.* > 0) self.previous_duration.* else 1;
 
             std.debug.print("Input {}, stream #{} ({s}) discontinuity, last.dts={}, pkt.dts={}, new offset={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.in_stream.*.codecpar.*.codec_type), self.previous_dts.*, pkt.dts, delta });
         }
@@ -625,9 +623,6 @@ const StreamContext = struct {
         // Offsets the current packet
         pkt.pts += delta;
         pkt.dts += delta;
-        if (pkt.pts < pkt.dts) {
-            std.debug.print("Input {}, stream #{} ({s}) invalid pts={}, dts={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.in_stream.*.codecpar.*.codec_type), pkt.pts, pkt.dts });
-        }
         // std.debug.print("After Input {}, stream #{} ({s}) pkt.pts={}, pkt.dts={}, delta={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.in_stream.*.codecpar.*.codec_type), pkt.pts, pkt.dts, delta });
 
         // Update the previous decoding timestamp
