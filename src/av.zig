@@ -13,72 +13,107 @@ const Transcoder = struct {
     enc_ctx: ?*c.AVCodecContext = null,
 
     dec_frame: ?*c.AVFrame = null,
+    enc_pkt: ?*c.AVPacket = null,
 
-    fn prepare_decoder(self: *Transcoder, in_stream: *c.AVStream) !void {
+    fn prepare_decoder(
+        self: *Transcoder,
+        ifmt_ctx: *const c.AVFormatContext,
+        in_stream: *const c.AVStream,
+    ) !*c.AVCodecContext {
         // Prepare decoder context
         const dec = c.avcodec_find_decoder(in_stream.*.codecpar.*.codec_id);
         if (dec == null) {
             std.debug.print("couldn't find decoder\n", .{});
             return error.AVError;
         }
-        const codec_ctx = c.avcodec_alloc_context3(dec);
-        if (codec_ctx == null) {
+        const dec_ctx = c.avcodec_alloc_context3(dec);
+        if (dec_ctx == null) {
             err.print("avcodec_alloc_context3", c.AVERROR(c.ENOMEM));
             return error.AVError;
         }
-        errdefer c.avcodec_free_context(@constCast(@ptrCast(&codec_ctx)));
-        const ret = c.avcodec_parameters_to_context(codec_ctx, in_stream.*.codecpar);
+        errdefer c.avcodec_free_context(@constCast(@ptrCast(&dec_ctx)));
+        var ret = c.avcodec_parameters_to_context(dec_ctx, in_stream.*.codecpar);
         if (ret < 0) {
             err.print("avcodec_parameters_to_context", ret);
             return error.AVError;
         }
 
-        self.dec_ctx = codec_ctx;
-        self.dec_frame = c.av_frame_alloc();
-        if (self.dec_frame == null) {
-            err.print("av_frame_alloc", c.AVERROR(c.ENOMEM));
-            return error.AVError;
-        }
-    }
+        // Inform the decoder about the timebase for the packet timestamps.
+        // This is highly recommended, but not mandatory.
+        dec_ctx.*.pkt_timebase = in_stream.*.time_base;
 
-    fn prepare_encoder(self: *Transcoder, ofmt_ctx: *c.AVFormatContext) !void {
-        const enc = c.avcodec_find_encoder(c.AV_CODEC_ID_AV1);
-        if (enc == null) {
-            std.debug.print("couldn't find encoder\n", .{});
-            return error.AVError;
-        }
-        const codec_ctx = c.avcodec_alloc_context3(enc);
-        if (codec_ctx == null) {
-            err.print("avcodec_alloc_context3", c.AVERROR(c.ENOMEM));
-            return error.AVError;
-        }
-        errdefer c.avcodec_free_context(@constCast(@ptrCast(&codec_ctx)));
-
-        const dec_ctx = self.dec_ctx.?;
-
-        // Copy codec format
-        codec_ctx.*.width = dec_ctx.*.width;
-        codec_ctx.*.height = dec_ctx.*.height;
-        codec_ctx.*.sample_aspect_ratio = dec_ctx.*.sample_aspect_ratio;
-        if (enc.*.pix_fmts != null) {
-            codec_ctx.*.pix_fmt = enc.*.pix_fmts[0];
-        } else {
-            codec_ctx.*.pix_fmt = dec_ctx.*.pix_fmt;
-        }
-        codec_ctx.*.time_base = c.av_inv_q(dec_ctx.*.framerate);
-
-        if (ofmt_ctx.*.oformat.*.flags & c.AVFMT_GLOBALHEADER != 0) {
-            codec_ctx.*.flags |= c.AV_CODEC_FLAG_GLOBAL_HEADER;
+        if (dec_ctx.*.codec_type == c.AVMEDIA_TYPE_VIDEO) {
+            dec_ctx.*.framerate = c.av_guess_frame_rate(@constCast(ifmt_ctx), @constCast(in_stream), null);
+            if (dec_ctx.*.framerate.num == 0 or dec_ctx.*.framerate.den == 0) {
+                err.print("couldn't guess framerate", c.AVERROR(c.EINVAL));
+                return error.AVError;
+            }
         }
 
-        // Open encoder
-        const ret = c.avcodec_open2(codec_ctx, enc, null);
+        ret = c.avcodec_open2(dec_ctx, dec, null);
         if (ret < 0) {
             err.print("avcodec_open2", ret);
             return error.AVError;
         }
 
-        self.enc_ctx = codec_ctx;
+        self.dec_ctx = dec_ctx;
+        self.dec_frame = c.av_frame_alloc();
+        if (self.dec_frame == null) {
+            err.print("av_frame_alloc", c.AVERROR(c.ENOMEM));
+            return error.AVError;
+        }
+
+        return dec_ctx;
+    }
+
+    fn prepare_encoder(self: *Transcoder, ofmt_ctx: *const c.AVFormatContext) !*c.AVCodecContext {
+        const enc = c.avcodec_find_encoder(c.AV_CODEC_ID_AV1);
+        if (enc == null) {
+            std.debug.print("couldn't find encoder\n", .{});
+            return error.AVError;
+        }
+        const enc_ctx = c.avcodec_alloc_context3(enc);
+        if (enc_ctx == null) {
+            err.print("avcodec_alloc_context3", c.AVERROR(c.ENOMEM));
+            return error.AVError;
+        }
+        errdefer c.avcodec_free_context(@constCast(@ptrCast(&enc_ctx)));
+
+        const dec_ctx = self.dec_ctx.?;
+
+        // Copy codec format
+        enc_ctx.*.width = dec_ctx.*.width;
+        enc_ctx.*.height = dec_ctx.*.height;
+        enc_ctx.*.sample_aspect_ratio = dec_ctx.*.sample_aspect_ratio;
+        if (enc.*.pix_fmts != null) {
+            enc_ctx.*.pix_fmt = enc.*.pix_fmts[0];
+        } else {
+            enc_ctx.*.pix_fmt = dec_ctx.*.pix_fmt;
+        }
+        enc_ctx.*.time_base = c.av_inv_q(dec_ctx.*.framerate);
+        enc_ctx.*.framerate = dec_ctx.*.framerate;
+        // Set lossless encoding
+        enc_ctx.*.properties |= c.AV_CODEC_PROP_LOSSLESS;
+
+        if (ofmt_ctx.*.oformat.*.flags & c.AVFMT_GLOBALHEADER != 0) {
+            enc_ctx.*.flags |= c.AV_CODEC_FLAG_GLOBAL_HEADER;
+        }
+
+        // Open encoder
+        const ret = c.avcodec_open2(enc_ctx, enc, null);
+        if (ret < 0) {
+            err.print("avcodec_open2", ret);
+            return error.AVError;
+        }
+
+        self.enc_ctx = enc_ctx;
+        self.enc_pkt = c.av_packet_alloc();
+        if (self.enc_pkt == null) {
+            err.print("av_packet_alloc", c.AVERROR(c.ENOMEM));
+            return error.AVError;
+        }
+
+        return enc_ctx;
     }
 
     pub fn deinit(self: *Transcoder) void {
@@ -90,6 +125,9 @@ const Transcoder = struct {
         }
         if (self.dec_frame != null) {
             c.av_frame_free(&self.dec_frame);
+        }
+        if (self.enc_pkt != null) {
+            c.av_packet_free(&self.enc_pkt);
         }
     }
 };
@@ -138,6 +176,7 @@ pub const ConcatContext = struct {
     allocator: std.mem.Allocator,
     prev_dts: std.ArrayList([]i64),
     prev_pts: std.ArrayList([]i64),
+    stream_ctxs: std.ArrayList([]StreamContext),
 
     pub fn init(allocator: std.mem.Allocator, input_files_len: usize) !ConcatContext {
         const optional_pkt: ?*c.AVPacket = c.av_packet_alloc();
@@ -160,6 +199,13 @@ pub const ConcatContext = struct {
             }
             prev_pts.deinit();
         }
+        var stream_ctxs = try std.ArrayList([]StreamContext).initCapacity(allocator, input_files_len);
+        errdefer {
+            for (stream_ctxs.items) |ppts| {
+                allocator.free(ppts);
+            }
+            stream_ctxs.deinit();
+        }
 
         // Set "faststart" option
         var optional_av_opts: ?*c.AVDictionary = null;
@@ -175,6 +221,7 @@ pub const ConcatContext = struct {
             .allocator = allocator,
             .prev_dts = prev_dts,
             .prev_pts = prev_pts,
+            .stream_ctxs = stream_ctxs,
         };
     }
 
@@ -193,6 +240,11 @@ pub const ConcatContext = struct {
             self.allocator.free(ppts);
         }
         self.prev_pts.deinit();
+
+        for (self.stream_ctxs.items) |stream_ctx| {
+            self.allocator.free(stream_ctx);
+        }
+        self.stream_ctxs.deinit();
     }
 };
 
@@ -255,18 +307,19 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
         var dts_offset = try allocator.alloc(i64, stream_mapping_size);
         defer allocator.free(dts_offset);
         var transcoders = try allocator.alloc(Transcoder, stream_mapping_size);
-        for (transcoders) |*sc| {
-            sc.* = .{};
+        for (transcoders) |*tc| {
+            tc.* = .{};
         }
         defer {
-            for (transcoders) |*sc| {
-                sc.deinit();
+            for (transcoders) |*tc| {
+                tc.deinit();
             }
             allocator.free(transcoders);
         }
 
         try ctx.prev_dts.append(try allocator.alloc(i64, stream_mapping_size));
         try ctx.prev_pts.append(try allocator.alloc(i64, stream_mapping_size));
+        try ctx.stream_ctxs.append(try allocator.alloc(StreamContext, stream_mapping_size));
 
         // Add audio and video streams to output context.
         // Map streams from input to output.
@@ -295,7 +348,7 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
 
                 // Prepare decoder context if using AV1 transcoding
                 if (opts.to_av1 and in_codecpar.*.codec_type == c.AVMEDIA_TYPE_VIDEO) {
-                    try transcoders[out_stream_index].prepare_decoder(in_stream);
+                    _ = try transcoders[out_stream_index].prepare_decoder(ifmt_ctx, in_stream);
                 }
 
                 // Only create streams based on the first video.
@@ -307,13 +360,10 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
                         return error.AVError;
                     }
 
-                    out_stream.*.codecpar.*.codec_tag = 0;
                     switch (in_codecpar.*.codec_type) {
                         c.AVMEDIA_TYPE_VIDEO => {
                             if (opts.to_av1 and transcoders[out_stream_index].dec_ctx != null) {
-                                try transcoders[out_stream_index].prepare_encoder(ofmt_ctx);
-                                // Note: checks for freeing enc_ctx is above.
-                                out_stream.*.time_base = transcoders[out_stream_index].enc_ctx.?.time_base;
+                                const enc_ctx = try transcoders[out_stream_index].prepare_encoder(ofmt_ctx);
 
                                 // Copy codec parameters
                                 ret = c.avcodec_parameters_from_context(out_stream.*.codecpar, transcoders[out_stream_index].enc_ctx);
@@ -321,6 +371,8 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
                                     err.print("avcodec_parameters_from_context", ret);
                                     return error.AVError;
                                 }
+
+                                out_stream.*.time_base = enc_ctx.*.time_base;
                             } else {
                                 // Remux
                                 ret = c.avcodec_parameters_copy(out_stream.*.codecpar, in_codecpar);
@@ -356,10 +408,28 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
                 }
 
                 // Set to zero
-                prev_duration[i] = 0;
-                dts_offset[i] = 0;
-                ctx.prev_dts.items[input_idx][i] = c.AV_NOPTS_VALUE;
-                ctx.prev_pts.items[input_idx][i] = c.AV_NOPTS_VALUE;
+                prev_duration[out_stream_index] = 0;
+                dts_offset[out_stream_index] = 0;
+                ctx.prev_dts.items[input_idx][out_stream_index] = c.AV_NOPTS_VALUE;
+                ctx.prev_pts.items[input_idx][out_stream_index] = c.AV_NOPTS_VALUE;
+
+                // DTS and PTS of last input file for concatenation
+                const previous_input_dts: ?*i64 = if (input_idx > 0) &ctx.prev_dts.items[input_idx - 1][out_stream_index] else null;
+                const previous_input_pts: ?*i64 = if (input_idx > 0) &ctx.prev_pts.items[input_idx - 1][out_stream_index] else null;
+                ctx.stream_ctxs.items[input_idx][out_stream_index] = .{
+                    .in_stream = in_stream,
+                    .out_stream = ofmt_ctx.streams[out_stream_index],
+                    .ofmt_ctx = ofmt_ctx,
+                    .dts_offset = &dts_offset[out_stream_index],
+                    .previous_dts = &ctx.prev_dts.items[input_idx][out_stream_index],
+                    .previous_pts = &ctx.prev_pts.items[input_idx][out_stream_index],
+                    .previous_duration = &prev_duration[out_stream_index],
+                    .previous_input_dts = previous_input_dts,
+                    .previous_input_pts = previous_input_pts,
+                    .stream_index = out_stream_index,
+                    .input_index = input_idx,
+                    .transcoder = &transcoders[out_stream_index],
+                };
             }
         }
 
@@ -375,7 +445,7 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
                     return error.AVError;
                 }
             }
-            // Note: checks for avio_close is above.
+            // Note: checks for avio_close is above.;
 
             // Write header
             ret = c.avformat_write_header(ofmt_ctx, &ctx.av_opts);
@@ -400,57 +470,43 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
                 continue;
             }
             const out_stream_index = @as(usize, @intCast(stream_mapping[in_stream_index]));
+            const stream_ctx = ctx.stream_ctxs.items[input_idx][out_stream_index];
 
-            const in_stream = ifmt_ctx.streams[in_stream_index];
-            const out_stream = ofmt_ctx.streams[out_stream_index];
-            const stream_ctx = &transcoders[out_stream_index];
-
-            // DTS and PTS of last input file for concatenation
-            const previous_input_dts: ?*i64 = if (input_idx > 0) &ctx.prev_dts.items[input_idx - 1][out_stream_index] else null;
-            const previous_input_pts: ?*i64 = if (input_idx > 0) &ctx.prev_pts.items[input_idx - 1][out_stream_index] else null;
-            const previous_dts: *i64 = &ctx.prev_dts.items[input_idx][out_stream_index];
-            const previous_pts: *i64 = &ctx.prev_pts.items[input_idx][out_stream_index];
-            const previous_duration: *i64 = &prev_duration[out_stream_index];
-
-            var processor: Processor = .{
-                .in_stream = in_stream,
-                .out_stream = out_stream,
-                .ofmt_ctx = ofmt_ctx,
-                .dts_offset = &dts_offset[out_stream_index],
-                .previous_dts = previous_dts,
-                .previous_pts = previous_pts,
-                .previous_duration = previous_duration,
-                .previous_input_dts = previous_input_dts,
-                .previous_input_pts = previous_input_pts,
-                .stream_index = out_stream_index,
-                .input_index = input_idx,
-                .stream_ctx = stream_ctx,
-            };
-
-            if (opts.to_av1 and stream_ctx.enc_ctx != null) {
-                c.av_packet_rescale_ts(ctx.pkt, in_stream.*.time_base, stream_ctx.*.dec_ctx.?.time_base);
-
-                try processor.transcode_write_frame(ctx.pkt);
+            if (opts.to_av1 and stream_ctx.transcoder.enc_ctx != null) {
+                // Input to decoder timebase
+                try stream_ctx.transcode_write_frame(ctx.pkt);
             } else {
                 // Remux packet
-                c.av_packet_rescale_ts(ctx.pkt, in_stream.*.time_base, out_stream.*.time_base);
+                c.av_packet_rescale_ts(ctx.pkt, stream_ctx.in_stream.*.time_base, stream_ctx.out_stream.*.time_base);
 
-                try processor.remux_write_frame(ctx.pkt);
+                try stream_ctx.fix_ts(ctx.pkt);
+
+                ret = c.av_interleaved_write_frame(ofmt_ctx, ctx.pkt);
+                if (ret < 0) {
+                    err.print("av_interleaved_write_frame", ret);
+                    return error.AVError;
+                }
             }
         } // while packets.
-        // TODO: flush encoder
+
+        // Flush encoder
+        for (ctx.stream_ctxs.items[input_idx]) |*sc| {
+            if (sc.transcoder.enc_ctx != null) {
+                try sc.flush_encoder();
+            }
+        }
     } // for each input.
 
     // Write trailer: file is ready and readable.
     _ = c.av_write_trailer(optional_ofmt_ctx);
 }
 
-const Processor = struct {
+const StreamContext = struct {
     in_stream: *c.AVStream,
     out_stream: *c.AVStream,
 
     ofmt_ctx: *c.AVFormatContext,
-    stream_ctx: *Transcoder,
+    transcoder: *Transcoder,
 
     input_index: usize,
     stream_index: usize,
@@ -462,14 +518,9 @@ const Processor = struct {
     previous_input_dts: ?*i64,
     previous_input_pts: ?*i64,
 
-    pkt: ?*c.AVPacket = null,
-
-    fn transcode_write_frame(self: *Processor, pkt: *c.AVPacket) !void {
-        // Cache packet for reuse in the encoder.
-        self.pkt = pkt;
-
+    fn transcode_write_frame(self: StreamContext, pkt: *c.AVPacket) !void {
         // Send packet to decoder
-        var ret = c.avcodec_send_packet(self.stream_ctx.*.dec_ctx, pkt);
+        var ret = c.avcodec_send_packet(self.transcoder.*.dec_ctx, pkt);
         if (ret < 0) {
             err.print("avcodec_send_packet", ret);
             return error.AVError;
@@ -477,27 +528,31 @@ const Processor = struct {
 
         while (ret >= 0) {
             // Fetch decoded frame from decoded packet
-            ret = c.avcodec_receive_frame(self.stream_ctx.*.dec_ctx, self.stream_ctx.*.dec_frame);
+            ret = c.avcodec_receive_frame(self.transcoder.*.dec_ctx, self.transcoder.*.dec_frame);
             if (ret == c.AVERROR(c.EAGAIN) or ret == c.AVERROR_EOF) {
-                break;
+                return;
             } else if (ret < 0) {
                 err.print("avcodec_receive_frame", ret);
                 return error.AVError;
             }
-            var frame = self.stream_ctx.*.dec_frame.?;
+            const frame = self.transcoder.*.dec_frame.?;
+            defer c.av_frame_unref(frame);
 
-            frame.pts = frame.best_effort_timestamp;
+            frame.*.pts = frame.best_effort_timestamp;
             try self.encode_write_frame(frame);
         }
     }
 
-    fn encode_write_frame(self: *Processor, dec_frame: *c.AVFrame) !void {
-        const pkt = self.pkt.?;
-        // Packet is reused
+    fn encode_write_frame(self: StreamContext, dec_frame: ?*c.AVFrame) !void {
+        const pkt = self.transcoder.enc_pkt.?;
         c.av_packet_unref(pkt);
 
+        if (dec_frame != null and dec_frame.?.*.pts != c.AV_NOPTS_VALUE) {
+            dec_frame.?.*.pts = c.av_rescale_q(dec_frame.?.*.pts, self.transcoder.dec_ctx.?.*.pkt_timebase, self.transcoder.enc_ctx.?.*.time_base);
+        }
+
         // Send frame to encoder
-        var ret = c.avcodec_send_frame(self.stream_ctx.enc_ctx, dec_frame);
+        var ret = c.avcodec_send_frame(self.transcoder.enc_ctx, dec_frame);
         if (ret < 0) {
             err.print("avcodec_send_frame", ret);
             return error.AVError;
@@ -505,7 +560,7 @@ const Processor = struct {
 
         while (ret >= 0) {
             // Read encoded data from the encoder.
-            ret = c.avcodec_receive_packet(self.stream_ctx.enc_ctx, pkt);
+            ret = c.avcodec_receive_packet(self.transcoder.enc_ctx, pkt);
             if (ret == c.AVERROR(c.EAGAIN) or ret == c.AVERROR_EOF) {
                 return;
             } else if (ret < 0) {
@@ -515,16 +570,30 @@ const Processor = struct {
 
             // Remux the packet
             pkt.stream_index = @as(c_int, @intCast(self.stream_index));
-            c.av_packet_rescale_ts(pkt, self.stream_ctx.enc_ctx.?.*.time_base, self.out_stream.*.time_base);
 
-            try self.remux_write_frame(pkt);
+            // Encoder to output timebase
+            c.av_packet_rescale_ts(pkt, self.transcoder.enc_ctx.?.*.time_base, self.out_stream.*.time_base);
+
+            try self.fix_ts(pkt);
+
+            // Write packet
+            ret = c.av_interleaved_write_frame(self.ofmt_ctx, pkt);
+            if (ret < 0) {
+                err.print("av_interleaved_write_frame", ret);
+                return error.AVError;
+            }
         }
     }
 
-    fn remux_write_frame(self: *Processor, pkt: *c.AVPacket) !void {
-        // Storing just in case
-        self.pkt = pkt;
+    fn flush_encoder(self: StreamContext) !void {
+        if (self.transcoder.enc_ctx.?.*.codec.*.capabilities & c.AV_CODEC_CAP_DELAY == 0) {
+            return;
+        }
 
+        try self.encode_write_frame(null);
+    }
+
+    fn fix_ts(self: StreamContext, pkt: *c.AVPacket) !void {
         // Offset due to discontinuity
         pkt.pts += self.dts_offset.*;
         pkt.dts += self.dts_offset.*;
@@ -556,10 +625,10 @@ const Processor = struct {
             self.previous_dts.* >= pkt.dts)
         {
             // Offset because of discontinuity
-            delta = self.previous_dts.* - pkt.dts + self.previous_duration.*;
+            delta = self.previous_dts.* + 1 - pkt.dts + self.previous_duration.*;
             self.dts_offset.* += delta;
 
-            std.debug.print("Input {}, stream #{} ({s}) discontinuity, shifting {}, new offset={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.in_stream.*.codecpar.*.codec_type), delta, self.dts_offset.* });
+            std.debug.print("Input {}, stream #{} ({s}) discontinuity, last.dts={}, new.dts={}, shifting {}, new offset={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.in_stream.*.codecpar.*.codec_type), self.previous_dts.*, pkt.dts, delta, self.dts_offset.* });
         }
 
         // Offsets the current packet
@@ -572,12 +641,5 @@ const Processor = struct {
         self.previous_duration.* = pkt.duration;
 
         pkt.pos = -1;
-
-        // Write packet
-        const ret = c.av_interleaved_write_frame(self.ofmt_ctx, pkt);
-        if (ret < 0) {
-            err.print("av_interleaved_write_frame", ret);
-            return error.AVError;
-        }
     }
 };
