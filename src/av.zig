@@ -67,7 +67,8 @@ const Transcoder = struct {
     }
 
     fn prepare_encoder(self: *Transcoder, ofmt_ctx: *const c.AVFormatContext) !*c.AVCodecContext {
-        const enc = c.avcodec_find_encoder(c.AV_CODEC_ID_AV1);
+        const enc = c.avcodec_find_encoder(self.dec_ctx.?.*.codec_id);
+        //const enc = c.avcodec_find_encoder(c.AV_CODEC_ID_AV1);
         if (enc == null) {
             std.debug.print("couldn't find encoder\n", .{});
             return error.AVError;
@@ -91,7 +92,6 @@ const Transcoder = struct {
             enc_ctx.*.pix_fmt = dec_ctx.*.pix_fmt;
         }
         enc_ctx.*.time_base = c.av_inv_q(dec_ctx.*.framerate);
-        enc_ctx.*.framerate = dec_ctx.*.framerate;
         // Set lossless encoding
         enc_ctx.*.properties |= c.AV_CODEC_PROP_LOSSLESS;
 
@@ -175,7 +175,7 @@ pub const ConcatContext = struct {
     pkt: *c.AVPacket,
     allocator: std.mem.Allocator,
     prev_dts: std.ArrayList([]i64),
-    prev_pts: std.ArrayList([]i64),
+    prev_duration: std.ArrayList([]i64),
     stream_ctxs: std.ArrayList([]StreamContext),
 
     pub fn init(allocator: std.mem.Allocator, input_files_len: usize) !ConcatContext {
@@ -192,17 +192,17 @@ pub const ConcatContext = struct {
             }
             prev_dts.deinit();
         }
-        var prev_pts = try std.ArrayList([]i64).initCapacity(allocator, input_files_len);
+        var prev_duration = try std.ArrayList([]i64).initCapacity(allocator, input_files_len);
         errdefer {
-            for (prev_pts.items) |ppts| {
-                allocator.free(ppts);
+            for (prev_duration.items) |pduration| {
+                allocator.free(pduration);
             }
-            prev_pts.deinit();
+            prev_duration.deinit();
         }
         var stream_ctxs = try std.ArrayList([]StreamContext).initCapacity(allocator, input_files_len);
         errdefer {
-            for (stream_ctxs.items) |ppts| {
-                allocator.free(ppts);
+            for (stream_ctxs.items) |stream_ctx| {
+                allocator.free(stream_ctx);
             }
             stream_ctxs.deinit();
         }
@@ -220,7 +220,7 @@ pub const ConcatContext = struct {
             .pkt = optional_pkt.?,
             .allocator = allocator,
             .prev_dts = prev_dts,
-            .prev_pts = prev_pts,
+            .prev_duration = prev_duration,
             .stream_ctxs = stream_ctxs,
         };
     }
@@ -236,10 +236,10 @@ pub const ConcatContext = struct {
         }
         self.prev_dts.deinit();
 
-        for (self.prev_pts.items) |ppts| {
+        for (self.prev_duration.items) |ppts| {
             self.allocator.free(ppts);
         }
-        self.prev_pts.deinit();
+        self.prev_duration.deinit();
 
         for (self.stream_ctxs.items) |stream_ctx| {
             self.allocator.free(stream_ctx);
@@ -302,9 +302,10 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
         const stream_mapping_size = ifmt_ctx.nb_streams;
         var stream_mapping = try allocator.alloc(i64, stream_mapping_size);
         defer allocator.free(stream_mapping);
-        var prev_duration = try allocator.alloc(i64, stream_mapping_size);
-        defer allocator.free(prev_duration);
         var dts_offset = try allocator.alloc(i64, stream_mapping_size);
+        for (dts_offset) |*dts| {
+            dts.* = 0;
+        }
         defer allocator.free(dts_offset);
         var transcoders = try allocator.alloc(Transcoder, stream_mapping_size);
         for (transcoders) |*tc| {
@@ -318,7 +319,7 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
         }
 
         try ctx.prev_dts.append(try allocator.alloc(i64, stream_mapping_size));
-        try ctx.prev_pts.append(try allocator.alloc(i64, stream_mapping_size));
+        try ctx.prev_duration.append(try allocator.alloc(i64, stream_mapping_size));
         try ctx.stream_ctxs.append(try allocator.alloc(StreamContext, stream_mapping_size));
 
         // Add audio and video streams to output context.
@@ -359,7 +360,6 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
                         err.print("avformat_new_stream", c.AVERROR(c.ENOMEM));
                         return error.AVError;
                     }
-
                     switch (in_codecpar.*.codec_type) {
                         c.AVMEDIA_TYPE_VIDEO => {
                             if (opts.to_av1 and transcoders[out_stream_index].dec_ctx != null) {
@@ -380,7 +380,7 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
                                     err.print("avcodec_parameters_copy", ret);
                                     return error.AVError;
                                 }
-
+                                out_stream.*.codecpar.*.codec_tag = 0;
                                 out_stream.*.time_base = in_stream.*.time_base;
                             }
                         },
@@ -391,7 +391,7 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
                                 err.print("avcodec_parameters_copy", ret);
                                 return error.AVError;
                             }
-
+                            out_stream.*.codecpar.*.codec_tag = 0;
                             out_stream.*.time_base = c.AVRational{ .num = 1, .den = in_codecpar.*.sample_rate };
                         },
                         else => {
@@ -401,6 +401,7 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
                                 err.print("avcodec_parameters_copy", ret);
                                 return error.AVError;
                             }
+                            out_stream.*.codecpar.*.codec_tag = 0;
                         },
                     }
 
@@ -408,24 +409,22 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
                 }
 
                 // Set to zero
-                prev_duration[out_stream_index] = 0;
                 dts_offset[out_stream_index] = 0;
                 ctx.prev_dts.items[input_idx][out_stream_index] = c.AV_NOPTS_VALUE;
-                ctx.prev_pts.items[input_idx][out_stream_index] = c.AV_NOPTS_VALUE;
+                ctx.prev_duration.items[input_idx][out_stream_index] = 0;
 
                 // DTS and PTS of last input file for concatenation
                 const previous_input_dts: ?*i64 = if (input_idx > 0) &ctx.prev_dts.items[input_idx - 1][out_stream_index] else null;
-                const previous_input_pts: ?*i64 = if (input_idx > 0) &ctx.prev_pts.items[input_idx - 1][out_stream_index] else null;
+                const previous_input_duration: ?*i64 = if (input_idx > 0) &ctx.prev_duration.items[input_idx - 1][out_stream_index] else null;
                 ctx.stream_ctxs.items[input_idx][out_stream_index] = .{
                     .in_stream = in_stream,
                     .out_stream = ofmt_ctx.streams[out_stream_index],
                     .ofmt_ctx = ofmt_ctx,
                     .dts_offset = &dts_offset[out_stream_index],
                     .previous_dts = &ctx.prev_dts.items[input_idx][out_stream_index],
-                    .previous_pts = &ctx.prev_pts.items[input_idx][out_stream_index],
-                    .previous_duration = &prev_duration[out_stream_index],
+                    .previous_duration = &ctx.prev_duration.items[input_idx][out_stream_index],
                     .previous_input_dts = previous_input_dts,
-                    .previous_input_pts = previous_input_pts,
+                    .previous_input_duration = previous_input_duration,
                     .stream_index = out_stream_index,
                     .input_index = input_idx,
                     .transcoder = &transcoders[out_stream_index],
@@ -513,10 +512,9 @@ const StreamContext = struct {
 
     dts_offset: *i64,
     previous_dts: *i64,
-    previous_pts: *i64,
     previous_duration: *i64,
     previous_input_dts: ?*i64,
-    previous_input_pts: ?*i64,
+    previous_input_duration: ?*i64,
 
     fn transcode_write_frame(self: StreamContext, pkt: *c.AVPacket) !void {
         // Send packet to decoder
@@ -594,51 +592,48 @@ const StreamContext = struct {
     }
 
     fn fix_ts(self: StreamContext, pkt: *c.AVPacket) !void {
-        // Offset due to discontinuity
-        pkt.pts += self.dts_offset.*;
-        pkt.dts += self.dts_offset.*;
+        // std.debug.print("Before Input {}, stream #{} ({s}) pkt.pts={}, pkt.dts={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.in_stream.*.codecpar.*.codec_type), pkt.pts, pkt.dts });
 
-        // Offset due to concatenation
-        if (self.previous_input_pts != null and self.previous_input_pts.?.* != c.AV_NOPTS_VALUE) {
-            pkt.pts += self.previous_input_pts.?.* + 1;
-        }
-        if (self.previous_input_dts != null and self.previous_input_dts.?.* != c.AV_NOPTS_VALUE) {
-            pkt.dts += self.previous_input_dts.?.* + 1;
+        // Add past offsets.
+        var delta: i64 = self.dts_offset.*;
+
+        if (self.previous_dts.* == c.AV_NOPTS_VALUE) {
+            // Initial discontinuity
+            delta -= pkt.dts;
+
+            // Concatenation
+            if (self.previous_input_dts != null and self.previous_input_dts.?.* != c.AV_NOPTS_VALUE) {
+                delta += self.previous_input_dts.?.* + self.previous_input_duration.?.*;
+
+                std.debug.print("Input {}, stream #{} ({s}) concatenation, last.dts={}, pkt.dts{}, new offset={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.in_stream.*.codecpar.*.codec_type), self.previous_input_dts.?.*, pkt.dts, delta });
+                self.previous_dts.* = self.previous_input_dts.?.*;
+                self.previous_duration.* = self.previous_input_duration.?.*;
+            }
         }
 
         // Discontinuity detection
         // Set the dts_offset for the next iteration.
-        var delta: i64 = 0;
-        if (self.previous_dts.* == c.AV_NOPTS_VALUE) {
-            // Offset because of initial discontinuity
-            if (self.previous_input_dts != null and self.previous_input_dts.?.* != c.AV_NOPTS_VALUE) {
-                // Take account of the concatenation
-                delta = self.previous_input_dts.?.* + 1 - pkt.dts;
-            } else {
-                delta = -pkt.dts;
-            }
-
-            self.dts_offset.* += delta;
-
-            std.debug.print("Input {}, stream #{} ({s}) initial discontinuity, shifting {}, new offset={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.in_stream.*.codecpar.*.codec_type), delta, self.dts_offset.* });
-        } else if (self.previous_dts.* != c.AV_NOPTS_VALUE and
-            self.previous_dts.* >= pkt.dts)
+        if (self.previous_dts.* != c.AV_NOPTS_VALUE and
+            self.previous_dts.* >= pkt.dts + delta)
         {
             // Offset because of discontinuity
-            delta = self.previous_dts.* + 1 - pkt.dts + self.previous_duration.*;
-            self.dts_offset.* += delta;
+            delta += self.previous_dts.* + self.previous_duration.* - pkt.dts - delta;
 
-            std.debug.print("Input {}, stream #{} ({s}) discontinuity, last.dts={}, new.dts={}, shifting {}, new offset={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.in_stream.*.codecpar.*.codec_type), self.previous_dts.*, pkt.dts, delta, self.dts_offset.* });
+            std.debug.print("Input {}, stream #{} ({s}) discontinuity, last.dts={}, pkt.dts={}, new offset={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.in_stream.*.codecpar.*.codec_type), self.previous_dts.*, pkt.dts, delta });
         }
 
         // Offsets the current packet
         pkt.pts += delta;
         pkt.dts += delta;
+        if (pkt.pts < pkt.dts) {
+            std.debug.print("Input {}, stream #{} ({s}) invalid pts={}, dts={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.in_stream.*.codecpar.*.codec_type), pkt.pts, pkt.dts });
+        }
+        // std.debug.print("After Input {}, stream #{} ({s}) pkt.pts={}, pkt.dts={}, delta={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.in_stream.*.codecpar.*.codec_type), pkt.pts, pkt.dts, delta });
 
         // Update the previous decoding timestamp
         self.previous_dts.* = pkt.dts;
-        self.previous_pts.* = pkt.pts;
         self.previous_duration.* = pkt.duration;
+        self.dts_offset.* = delta;
 
         pkt.pos = -1;
     }
