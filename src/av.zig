@@ -8,78 +8,39 @@ const c = @cImport({
     @cInclude("libavutil/avutil.h");
 });
 
-const Transcoder = struct {
-    dec_ctx: ?*c.AVCodecContext = null,
-    enc_ctx: ?*c.AVCodecContext = null,
+const AVError = error{
+    Unknown,
+    EOF,
+    EAGAIN,
+    ENOMEM,
+    EINVAL,
+};
 
-    dec_frame: ?*c.AVFrame = null,
+fn ret_to_error(ret: c_int) AVError {
+    return switch (ret) {
+        c.AVERROR_EOF => AVError.EOF,
+        c.AVERROR(c.EAGAIN) => AVError.EAGAIN,
+        c.AVERROR(c.ENOMEM) => AVError.ENOMEM,
+        else => AVError.Unknown,
+    };
+}
+
+const Encoder = struct {
+    enc_ctx: ?*c.AVCodecContext = null,
     enc_pkt: ?*c.AVPacket = null,
 
-    fn prepare_decoder(
-        self: *Transcoder,
-        ifmt_ctx: *const c.AVFormatContext,
-        in_stream: *const c.AVStream,
-    ) !*c.AVCodecContext {
-        // Prepare decoder context
-        const dec = c.avcodec_find_decoder(in_stream.*.codecpar.*.codec_id);
-        if (dec == null) {
-            std.debug.print("couldn't find decoder\n", .{});
-            return error.AVError;
-        }
-        const dec_ctx = c.avcodec_alloc_context3(dec);
-        if (dec_ctx == null) {
-            err.print("avcodec_alloc_context3", c.AVERROR(c.ENOMEM));
-            return error.AVError;
-        }
-        errdefer c.avcodec_free_context(@constCast(@ptrCast(&dec_ctx)));
-        var ret = c.avcodec_parameters_to_context(dec_ctx, in_stream.*.codecpar);
-        if (ret < 0) {
-            err.print("avcodec_parameters_to_context", ret);
-            return error.AVError;
-        }
-
-        // Inform the decoder about the timebase for the packet timestamps.
-        // This is highly recommended, but not mandatory.
-        dec_ctx.*.pkt_timebase = in_stream.*.time_base;
-
-        if (dec_ctx.*.codec_type == c.AVMEDIA_TYPE_VIDEO) {
-            dec_ctx.*.framerate = c.av_guess_frame_rate(@constCast(ifmt_ctx), @constCast(in_stream), null);
-            if (dec_ctx.*.framerate.num == 0 or dec_ctx.*.framerate.den == 0) {
-                err.print("couldn't guess framerate", c.AVERROR(c.EINVAL));
-                return error.AVError;
-            }
-        }
-
-        ret = c.avcodec_open2(dec_ctx, dec, null);
-        if (ret < 0) {
-            err.print("avcodec_open2", ret);
-            return error.AVError;
-        }
-
-        self.dec_ctx = dec_ctx;
-        self.dec_frame = c.av_frame_alloc();
-        if (self.dec_frame == null) {
-            err.print("av_frame_alloc", c.AVERROR(c.ENOMEM));
-            return error.AVError;
-        }
-
-        return dec_ctx;
-    }
-
-    fn prepare_encoder(self: *Transcoder, ofmt_ctx: *const c.AVFormatContext) !*c.AVCodecContext {
+    fn prepare_encoder(self: *Encoder, ofmt_ctx: *const c.AVFormatContext, dec_ctx: *const c.AVCodecContext) !*c.AVCodecContext {
         const enc = c.avcodec_find_encoder(c.AV_CODEC_ID_AV1);
         if (enc == null) {
             std.debug.print("couldn't find encoder\n", .{});
-            return error.AVError;
+            return AVError.Unknown;
         }
         const enc_ctx = c.avcodec_alloc_context3(enc);
         if (enc_ctx == null) {
             err.print("avcodec_alloc_context3", c.AVERROR(c.ENOMEM));
-            return error.AVError;
+            return AVError.ENOMEM;
         }
         errdefer c.avcodec_free_context(@constCast(@ptrCast(&enc_ctx)));
-
-        const dec_ctx = self.dec_ctx.?;
 
         // Copy codec format
         enc_ctx.*.width = dec_ctx.*.width;
@@ -102,32 +63,299 @@ const Transcoder = struct {
         const ret = c.avcodec_open2(enc_ctx, enc, null);
         if (ret < 0) {
             err.print("avcodec_open2", ret);
-            return error.AVError;
+            return ret_to_error(ret);
         }
 
         self.enc_ctx = enc_ctx;
         self.enc_pkt = c.av_packet_alloc();
         if (self.enc_pkt == null) {
             err.print("av_packet_alloc", c.AVERROR(c.ENOMEM));
-            return error.AVError;
+            return AVError.ENOMEM;
         }
 
         return enc_ctx;
     }
 
-    pub fn deinit(self: *Transcoder) void {
-        if (self.dec_ctx != null) {
-            c.avcodec_free_context(&self.dec_ctx);
+    pub fn send_frame(self: *Encoder, frame: ?*c.AVFrame) !void {
+        const ret = c.avcodec_send_frame(self.enc_ctx.?, frame);
+        if (ret < 0) {
+            err.print("avcodec_send_frame", ret);
+            return ret_to_error(ret);
         }
+    }
+
+    pub fn receive_packet(self: *Encoder) !*c.AVPacket {
+        const ret = c.avcodec_receive_packet(self.enc_ctx.?, self.enc_pkt.?);
+        if (ret < 0) {
+            switch (ret) {
+                c.AVERROR_EOF => return AVError.EOF,
+                c.AVERROR(c.EAGAIN) => return AVError.EAGAIN,
+                else => {
+                    err.print("avcodec_receive_packet", ret);
+                    return ret_to_error(ret);
+                },
+            }
+        }
+        return self.enc_pkt.?;
+    }
+
+    pub fn unref_pkt(self: *Encoder) void {
+        c.av_packet_unref(self.enc_pkt);
+    }
+
+    pub fn deinit(self: *Encoder) void {
         if (self.enc_ctx != null) {
             c.avcodec_free_context(&self.enc_ctx);
-        }
-        if (self.dec_frame != null) {
-            c.av_frame_free(&self.dec_frame);
         }
         if (self.enc_pkt != null) {
             c.av_packet_free(&self.enc_pkt);
         }
+    }
+};
+
+const Decoder = struct {
+    dec_ctx: ?*c.AVCodecContext = null,
+    dec_frame: ?*c.AVFrame = null,
+
+    fn prepare_decoder(
+        self: *Decoder,
+        ifmt_ctx: *const c.AVFormatContext,
+        in_stream: *const c.AVStream,
+    ) !*c.AVCodecContext {
+        // Prepare decoder context
+        const dec = c.avcodec_find_decoder(in_stream.*.codecpar.*.codec_id);
+        if (dec == null) {
+            std.debug.print("couldn't find decoder\n", .{});
+            return AVError.Unknown;
+        }
+        const dec_ctx = c.avcodec_alloc_context3(dec);
+        if (dec_ctx == null) {
+            err.print("avcodec_alloc_context3", c.AVERROR(c.ENOMEM));
+            return AVError.ENOMEM;
+        }
+        errdefer c.avcodec_free_context(@constCast(@ptrCast(&dec_ctx)));
+        var ret = c.avcodec_parameters_to_context(dec_ctx, in_stream.*.codecpar);
+        if (ret < 0) {
+            err.print("avcodec_parameters_to_context", ret);
+            return ret_to_error(ret);
+        }
+
+        // Inform the decoder about the timebase for the packet timestamps.
+        // This is highly recommended, but not mandatory.
+        dec_ctx.*.pkt_timebase = in_stream.*.time_base;
+
+        if (dec_ctx.*.codec_type == c.AVMEDIA_TYPE_VIDEO) {
+            dec_ctx.*.framerate = c.av_guess_frame_rate(@constCast(ifmt_ctx), @constCast(in_stream), null);
+            if (dec_ctx.*.framerate.num == 0 or dec_ctx.*.framerate.den == 0) {
+                err.print("couldn't guess framerate", c.AVERROR(c.EINVAL));
+                return AVError.EINVAL;
+            }
+        }
+
+        ret = c.avcodec_open2(dec_ctx, dec, null);
+        if (ret < 0) {
+            err.print("avcodec_open2", ret);
+            return ret_to_error(ret);
+        }
+
+        self.dec_ctx = dec_ctx;
+        self.dec_frame = c.av_frame_alloc();
+        if (self.dec_frame == null) {
+            err.print("av_frame_alloc", c.AVERROR(c.ENOMEM));
+            return AVError.ENOMEM;
+        }
+
+        return dec_ctx;
+    }
+
+    pub fn send_packet(self: *Decoder, pkt: *c.AVPacket) !void {
+        const ret = c.avcodec_send_packet(self.dec_ctx, pkt);
+        if (ret < 0) {
+            err.print("avcodec_send_packet", ret);
+            return ret_to_error(ret);
+        }
+    }
+
+    pub fn receive_frame(self: *Decoder) !*c.AVFrame {
+        const ret = c.avcodec_receive_frame(self.dec_ctx, self.dec_frame.?);
+        if (ret < 0) {
+            switch (ret) {
+                c.AVERROR_EOF => return AVError.EOF,
+                c.AVERROR(c.EAGAIN) => return AVError.EAGAIN,
+                else => {
+                    err.print("avcodec_receive_frame", ret);
+                    return ret_to_error(ret);
+                },
+            }
+        }
+        return self.dec_frame.?;
+    }
+
+    pub fn deinit(self: *Decoder) void {
+        if (self.dec_ctx != null) {
+            c.avcodec_free_context(&self.dec_ctx);
+        }
+        if (self.dec_frame != null) {
+            c.av_frame_free(&self.dec_frame);
+        }
+    }
+};
+
+const StreamContext = struct {
+    in_stream: *c.AVStream,
+    out_stream: *c.AVStream,
+
+    ofmt_ctx: *c.AVFormatContext,
+    decoder: *Decoder,
+    encoder: *Encoder,
+
+    input_index: usize,
+    stream_index: usize,
+
+    dts_offset: []i64,
+    prev_dts: [][]i64,
+    prev_duration: [][]i64,
+
+    mux_dts_offset: []i64,
+    prev_mux_dts: [][]i64,
+    prev_mux_duration: [][]i64,
+
+    fn transcode_write_frame(self: StreamContext, pkt: *c.AVPacket) !void {
+        // Send packet to decoder
+        try self.decoder.send_packet(pkt);
+
+        while (true) {
+            // Fetch decoded frame from decoded packet
+            const frame = self.decoder.receive_frame() catch |e| switch (e) {
+                AVError.EAGAIN => return,
+                AVError.EOF => return,
+                else => return e,
+            };
+            defer c.av_frame_unref(frame);
+
+            frame.*.pts = frame.best_effort_timestamp;
+            try self.encode_write_frame(frame);
+        }
+    }
+
+    fn encode_write_frame(self: StreamContext, dec_frame: ?*c.AVFrame) !void {
+        self.encoder.unref_pkt();
+
+        if (dec_frame != null and dec_frame.?.*.pts != c.AV_NOPTS_VALUE) {
+            dec_frame.?.*.pts = c.av_rescale_q(dec_frame.?.*.pts, self.decoder.dec_ctx.?.*.pkt_timebase, self.encoder.enc_ctx.?.*.time_base);
+        }
+
+        try self.encoder.send_frame(dec_frame);
+
+        while (true) {
+            // Read encoded data from the encoder.
+            var pkt = self.encoder.receive_packet() catch |e| switch (e) {
+                AVError.EAGAIN => return,
+                AVError.EOF => return,
+                else => return e,
+            };
+
+            // Remux the packet
+            pkt.stream_index = @as(c_int, @intCast(self.stream_index));
+
+            // Encoder to output timebase
+            c.av_packet_rescale_ts(pkt, self.encoder.enc_ctx.?.*.time_base, self.out_stream.*.time_base);
+
+            try self.fix_monotonic_ts(pkt);
+
+            // Write packet
+            const ret = c.av_interleaved_write_frame(self.ofmt_ctx, pkt);
+            if (ret < 0) {
+                err.print("av_interleaved_write_frame", ret);
+                return ret_to_error(ret);
+            }
+        }
+    }
+
+    fn flush_encoder(self: StreamContext) !void {
+        if (self.encoder.enc_ctx.?.*.codec.*.capabilities & c.AV_CODEC_CAP_DELAY == 0) {
+            return;
+        }
+
+        try self.encode_write_frame(null);
+    }
+
+    fn fix_discontinuity_ts(self: StreamContext, pkt: *c.AVPacket) !void {
+        // Add past offsets.
+        var delta: i64 = self.dts_offset[self.stream_index];
+
+        if (self.prev_dts[self.input_index][self.stream_index] == c.AV_NOPTS_VALUE) {
+            // Initial discontinuity
+            delta -= pkt.dts;
+
+            // Concatenation
+            if (self.input_index > 0 and self.prev_dts[self.input_index - 1][self.stream_index] != c.AV_NOPTS_VALUE) {
+                delta += self.prev_dts[self.input_index - 1][self.stream_index];
+                delta += if (self.prev_duration[self.input_index - 1][self.stream_index] > 0) self.prev_duration[self.input_index - 1][self.stream_index] else 1;
+
+                std.debug.print("Input {}, stream #{} ({s}) concatenation, last.dts={}, pkt.dts={}, new offset={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.in_stream.*.codecpar.*.codec_type), self.prev_dts[self.input_index - 1][self.stream_index], pkt.dts, delta });
+                self.prev_dts[self.input_index][self.stream_index] = self.prev_dts[self.input_index - 1][self.stream_index];
+                self.prev_duration[self.input_index][self.stream_index] = self.prev_duration[self.input_index - 1][self.stream_index];
+            }
+        }
+
+        // Discontinuity detection
+        // Set the dts_offset for the next iteration.
+        if (self.prev_dts[self.input_index][self.stream_index] != c.AV_NOPTS_VALUE and
+            self.prev_dts[self.input_index][self.stream_index] >= pkt.dts + delta)
+        {
+            // Offset because of discontinuity
+            const old_delta = delta;
+            delta = self.prev_dts[self.input_index][self.stream_index] - pkt.dts;
+            delta += if (self.prev_duration[self.input_index][self.stream_index] > 0) self.prev_duration[self.input_index][self.stream_index] else 1;
+
+            std.debug.print("Input {}, stream #{} ({s}) discontinuity, last.dts={}, pkt.dts={}, new offset={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.in_stream.*.codecpar.*.codec_type), self.prev_dts[self.input_index][self.stream_index], pkt.dts + old_delta, delta });
+        }
+
+        // Offsets the current packet
+        pkt.dts += delta;
+        if (pkt.pts != c.AV_NOPTS_VALUE)
+            pkt.pts += delta;
+
+        // Update the previous decoding timestamp
+        self.prev_dts[self.input_index][self.stream_index] = pkt.dts;
+        self.prev_duration[self.input_index][self.stream_index] = pkt.duration;
+        self.dts_offset[self.stream_index] = delta;
+
+        pkt.pos = -1;
+    }
+
+    fn fix_monotonic_ts(self: StreamContext, pkt: *c.AVPacket) !void {
+        if (pkt.dts == c.AV_NOPTS_VALUE) {
+            return;
+        }
+
+        // Add past offsets.
+        var delta: i64 = self.mux_dts_offset[self.stream_index];
+
+        // Discontinuity detection
+        // Set the dts_offset for the next iteration.
+        if (self.prev_mux_dts[self.input_index][self.stream_index] != c.AV_NOPTS_VALUE and
+            self.prev_mux_dts[self.input_index][self.stream_index] >= pkt.dts + delta)
+        {
+            // Offset because of discontinuity
+            delta = self.prev_mux_dts[self.input_index][self.stream_index] - pkt.dts;
+            delta += if (self.prev_mux_duration[self.input_index][self.stream_index] > 0) self.prev_mux_duration[self.input_index][self.stream_index] else 1;
+
+            std.debug.print("Input {}, stream #{} ({s}) non-monotonic, last.dts={}, pkt.dts={}, new offset={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.in_stream.*.codecpar.*.codec_type), self.prev_mux_dts[self.input_index][self.stream_index], pkt.dts, delta });
+        }
+
+        // Offsets the current packet
+        pkt.dts += delta;
+        if (pkt.pts != c.AV_NOPTS_VALUE)
+            pkt.pts += delta;
+
+        // Update the previous decoding timestamp
+        self.prev_mux_dts[self.input_index][self.stream_index] = pkt.dts;
+        self.prev_mux_duration[self.input_index][self.stream_index] = pkt.duration;
+        self.mux_dts_offset[self.stream_index] = delta;
+
+        pkt.pos = -1;
     }
 };
 
@@ -148,7 +376,7 @@ pub fn probe(files: [][*:0]const u8, quiet: bool) !void {
         var ret = c.avformat_open_input(&ifmt_ctx, input_file, null, null);
         if (ret < 0) {
             err.print("avformat_open_input", ret);
-            return error.AVError;
+            return ret_to_error(ret);
         }
         defer c.avformat_close_input(&ifmt_ctx);
 
@@ -156,7 +384,7 @@ pub fn probe(files: [][*:0]const u8, quiet: bool) !void {
         ret = c.avformat_find_stream_info(ifmt_ctx, null);
         if (ret < 0) {
             err.print("avformat_find_stream_info", ret);
-            return error.AVError;
+            return ret_to_error(ret);
         }
 
         // Print input information
@@ -169,49 +397,46 @@ pub const ConcatOptions = struct {
     to_av1: bool = false,
 };
 
-pub const ConcatContext = struct {
+const ConcatContext = struct {
     av_opts: ?*c.AVDictionary,
     pkt: *c.AVPacket,
     allocator: std.mem.Allocator,
     prev_dts: std.ArrayList([]i64),
     prev_duration: std.ArrayList([]i64),
+
+    encoders: ?[]Encoder,
+    decoders: std.ArrayList([]Decoder),
     stream_ctxs: std.ArrayList([]StreamContext),
 
-    pub fn init(allocator: std.mem.Allocator, input_files_len: usize) !ConcatContext {
+    prev_mux_dts: std.ArrayList([]i64),
+    prev_mux_duration: std.ArrayList([]i64),
+
+    fn init(allocator: std.mem.Allocator, input_files_len: usize) !ConcatContext {
         const optional_pkt: ?*c.AVPacket = c.av_packet_alloc();
         if (optional_pkt == null) {
             err.print("av_packet_alloc", c.AVERROR(c.ENOMEM));
-            return error.AVError;
+            return AVError.ENOMEM;
         }
 
         var prev_dts = try std.ArrayList([]i64).initCapacity(allocator, input_files_len);
-        errdefer {
-            for (prev_dts.items) |pdts| {
-                allocator.free(pdts);
-            }
-            prev_dts.deinit();
-        }
+        errdefer prev_dts.deinit();
         var prev_duration = try std.ArrayList([]i64).initCapacity(allocator, input_files_len);
-        errdefer {
-            for (prev_duration.items) |pduration| {
-                allocator.free(pduration);
-            }
-            prev_duration.deinit();
-        }
+        errdefer prev_duration.deinit();
+        var decoders = try std.ArrayList([]Decoder).initCapacity(allocator, input_files_len);
+        errdefer decoders.deinit();
         var stream_ctxs = try std.ArrayList([]StreamContext).initCapacity(allocator, input_files_len);
-        errdefer {
-            for (stream_ctxs.items) |stream_ctx| {
-                allocator.free(stream_ctx);
-            }
-            stream_ctxs.deinit();
-        }
+        errdefer stream_ctxs.deinit();
+        var prev_mux_dts = try std.ArrayList([]i64).initCapacity(allocator, input_files_len);
+        errdefer prev_mux_dts.deinit();
+        var prev_mux_duration = try std.ArrayList([]i64).initCapacity(allocator, input_files_len);
+        errdefer prev_mux_duration.deinit();
 
         // Set "faststart" option
         var optional_av_opts: ?*c.AVDictionary = null;
         const ret = c.av_dict_set(&optional_av_opts, "movflags", "faststart", 0);
         if (ret < 0) {
             err.print("av_dict_set", ret);
-            return error.AVError;
+            return ret_to_error(ret);
         }
 
         return ConcatContext{
@@ -220,11 +445,67 @@ pub const ConcatContext = struct {
             .allocator = allocator,
             .prev_dts = prev_dts,
             .prev_duration = prev_duration,
+            .decoders = decoders,
             .stream_ctxs = stream_ctxs,
+            .prev_mux_dts = prev_mux_dts,
+            .prev_mux_duration = prev_mux_duration,
+            .encoders = null,
         };
     }
 
-    pub fn deinit(self: ConcatContext) void {
+    fn alloc_prev_dts(self: *ConcatContext, stream_mapping_size: usize) !void {
+        const prev_dts = try self.allocator.alloc(i64, stream_mapping_size);
+        for (prev_dts) |*pdts| {
+            pdts.* = c.AV_NOPTS_VALUE;
+        }
+        try self.prev_dts.append(prev_dts);
+    }
+
+    fn alloc_prev_duration(self: *ConcatContext, stream_mapping_size: usize) !void {
+        const prev_duration = try self.allocator.alloc(i64, stream_mapping_size);
+        for (prev_duration) |*ppts| {
+            ppts.* = 0;
+        }
+        try self.prev_duration.append(prev_duration);
+    }
+
+    fn alloc_prev_mux_dts(self: *ConcatContext, stream_mapping_size: usize) !void {
+        const prev_mux_dts = try self.allocator.alloc(i64, stream_mapping_size);
+        for (prev_mux_dts) |*pdts| {
+            pdts.* = c.AV_NOPTS_VALUE;
+        }
+        try self.prev_mux_dts.append(prev_mux_dts);
+    }
+
+    fn alloc_prev_mux_duration(self: *ConcatContext, stream_mapping_size: usize) !void {
+        const prev_mux_duration = try self.allocator.alloc(i64, stream_mapping_size);
+        for (prev_mux_duration) |*ppts| {
+            ppts.* = 0;
+        }
+        try self.prev_mux_duration.append(prev_mux_duration);
+    }
+
+    fn alloc_encoders(self: *ConcatContext, stream_mapping_size: usize) !void {
+        self.encoders = try self.allocator.alloc(Encoder, stream_mapping_size);
+        for (self.encoders.?) |*tc| {
+            tc.* = .{};
+        }
+    }
+
+    fn alloc_decoders(self: *ConcatContext, stream_mapping_size: usize) !void {
+        const decoders = try self.allocator.alloc(Decoder, stream_mapping_size);
+        for (decoders) |*dec| {
+            dec.* = .{};
+        }
+        try self.decoders.append(decoders);
+    }
+
+    fn alloc_stream_ctxs(self: *ConcatContext, stream_mapping_size: usize) !void {
+        const stream_ctxs = try self.allocator.alloc(StreamContext, stream_mapping_size);
+        try self.stream_ctxs.append(stream_ctxs);
+    }
+
+    fn deinit(self: ConcatContext) void {
         if (self.av_opts != null) {
             c.av_dict_free(@constCast(@ptrCast(&self.av_opts)));
         }
@@ -244,10 +525,34 @@ pub const ConcatContext = struct {
             self.allocator.free(stream_ctx);
         }
         self.stream_ctxs.deinit();
+
+        for (self.prev_mux_dts.items) |pdts| {
+            self.allocator.free(pdts);
+        }
+        self.prev_mux_dts.deinit();
+
+        for (self.prev_mux_duration.items) |ppts| {
+            self.allocator.free(ppts);
+        }
+        self.prev_mux_duration.deinit();
+
+        for (self.decoders.items) |decoders| {
+            for (decoders) |*tc| {
+                tc.deinit();
+            }
+            self.allocator.free(decoders);
+        }
+        self.decoders.deinit();
+
+        if (self.encoders != null) {
+            self.allocator.free(self.encoders.?);
+        }
     }
 };
 
 pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: ConcatOptions) !void {
+    c.av_log_set_level(c.AV_LOG_INFO);
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -266,7 +571,7 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
     var ret = c.avformat_alloc_output_context2(&optional_ofmt_ctx, null, null, output_file);
     if (ret < 0) {
         err.print("avformat_alloc_output_context2", ret);
-        return error.AVError;
+        return ret_to_error(ret);
     }
     var ofmt_ctx = optional_ofmt_ctx.?;
     defer {
@@ -283,7 +588,7 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
         ret = c.avformat_open_input(&optional_ifmt_ctx, input_file, null, null);
         if (ret < 0) {
             err.print("avformat_open_input", ret);
-            return error.AVError;
+            return ret_to_error(ret);
         }
         defer c.avformat_close_input(&optional_ifmt_ctx);
         const ifmt_ctx = optional_ifmt_ctx.?;
@@ -292,7 +597,7 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
         ret = c.avformat_find_stream_info(ifmt_ctx, null);
         if (ret < 0) {
             err.print("avformat_find_stream_info", ret);
-            return error.AVError;
+            return ret_to_error(ret);
         }
 
         c.av_dump_format(ifmt_ctx, 0, input_file, 0);
@@ -306,20 +611,21 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
             dts.* = 0;
         }
         defer allocator.free(dts_offset);
-        var transcoders = try allocator.alloc(Transcoder, stream_mapping_size);
-        for (transcoders) |*tc| {
-            tc.* = .{};
+        var mux_dts_offset = try allocator.alloc(i64, stream_mapping_size);
+        for (mux_dts_offset) |*dts| {
+            dts.* = 0;
         }
-        defer {
-            for (transcoders) |*tc| {
-                tc.deinit();
-            }
-            allocator.free(transcoders);
-        }
+        defer allocator.free(mux_dts_offset);
 
-        try ctx.prev_dts.append(try allocator.alloc(i64, stream_mapping_size));
-        try ctx.prev_duration.append(try allocator.alloc(i64, stream_mapping_size));
-        try ctx.stream_ctxs.append(try allocator.alloc(StreamContext, stream_mapping_size));
+        try ctx.alloc_decoders(stream_mapping_size);
+        if (input_idx == 0) {
+            try ctx.alloc_encoders(stream_mapping_size);
+        }
+        try ctx.alloc_prev_dts(stream_mapping_size);
+        try ctx.alloc_prev_duration(stream_mapping_size);
+        try ctx.alloc_stream_ctxs(stream_mapping_size);
+        try ctx.alloc_prev_mux_dts(stream_mapping_size);
+        try ctx.alloc_prev_mux_duration(stream_mapping_size);
 
         // Add audio and video streams to output context.
         // Map streams from input to output.
@@ -348,7 +654,7 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
 
                 // Prepare decoder context if using AV1 transcoding
                 if (opts.to_av1 and in_codecpar.*.codec_type == c.AVMEDIA_TYPE_VIDEO) {
-                    _ = try transcoders[out_stream_index].prepare_decoder(ifmt_ctx, in_stream);
+                    _ = try ctx.decoders.items[input_idx][out_stream_index].prepare_decoder(ifmt_ctx, in_stream);
                 }
 
                 // Only create streams based on the first video.
@@ -357,18 +663,18 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
                     const out_stream = c.avformat_new_stream(optional_ofmt_ctx, null);
                     if (out_stream == null) {
                         err.print("avformat_new_stream", c.AVERROR(c.ENOMEM));
-                        return error.AVError;
+                        return AVError.ENOMEM;
                     }
                     switch (in_codecpar.*.codec_type) {
                         c.AVMEDIA_TYPE_VIDEO => {
-                            if (opts.to_av1 and transcoders[out_stream_index].dec_ctx != null) {
-                                const enc_ctx = try transcoders[out_stream_index].prepare_encoder(ofmt_ctx);
+                            if (opts.to_av1 and ctx.decoders.items[input_idx][out_stream_index].dec_ctx != null) {
+                                const enc_ctx = try ctx.encoders.?[out_stream_index].prepare_encoder(ofmt_ctx, ctx.decoders.items[input_idx][out_stream_index].dec_ctx.?);
 
                                 // Copy codec parameters
-                                ret = c.avcodec_parameters_from_context(out_stream.*.codecpar, transcoders[out_stream_index].enc_ctx);
+                                ret = c.avcodec_parameters_from_context(out_stream.*.codecpar, ctx.encoders.?[out_stream_index].enc_ctx);
                                 if (ret < 0) {
                                     err.print("avcodec_parameters_from_context", ret);
-                                    return error.AVError;
+                                    return ret_to_error(ret);
                                 }
 
                                 out_stream.*.time_base = enc_ctx.*.time_base;
@@ -377,7 +683,7 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
                                 ret = c.avcodec_parameters_copy(out_stream.*.codecpar, in_codecpar);
                                 if (ret < 0) {
                                     err.print("avcodec_parameters_copy", ret);
-                                    return error.AVError;
+                                    return ret_to_error(ret);
                                 }
                                 out_stream.*.codecpar.*.codec_tag = 0;
                                 out_stream.*.time_base = in_stream.*.time_base;
@@ -388,7 +694,7 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
                             ret = c.avcodec_parameters_copy(out_stream.*.codecpar, in_codecpar);
                             if (ret < 0) {
                                 err.print("avcodec_parameters_copy", ret);
-                                return error.AVError;
+                                return ret_to_error(ret);
                             }
                             out_stream.*.codecpar.*.codec_tag = 0;
                             out_stream.*.time_base = c.AVRational{ .num = 1, .den = in_codecpar.*.sample_rate };
@@ -398,7 +704,7 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
                             ret = c.avcodec_parameters_copy(out_stream.*.codecpar, in_codecpar);
                             if (ret < 0) {
                                 err.print("avcodec_parameters_copy", ret);
-                                return error.AVError;
+                                return ret_to_error(ret);
                             }
                             out_stream.*.codecpar.*.codec_tag = 0;
                         },
@@ -409,24 +715,23 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
 
                 // Set to zero
                 dts_offset[out_stream_index] = 0;
-                ctx.prev_dts.items[input_idx][out_stream_index] = c.AV_NOPTS_VALUE;
-                ctx.prev_duration.items[input_idx][out_stream_index] = 0;
+                mux_dts_offset[out_stream_index] = 0;
 
                 // DTS and PTS of last input file for concatenation
-                const previous_input_dts: ?*i64 = if (input_idx > 0) &ctx.prev_dts.items[input_idx - 1][out_stream_index] else null;
-                const previous_input_duration: ?*i64 = if (input_idx > 0) &ctx.prev_duration.items[input_idx - 1][out_stream_index] else null;
                 ctx.stream_ctxs.items[input_idx][out_stream_index] = .{
                     .in_stream = in_stream,
                     .out_stream = ofmt_ctx.streams[out_stream_index],
                     .ofmt_ctx = ofmt_ctx,
-                    .dts_offset = &dts_offset[out_stream_index],
-                    .previous_dts = &ctx.prev_dts.items[input_idx][out_stream_index],
-                    .previous_duration = &ctx.prev_duration.items[input_idx][out_stream_index],
-                    .previous_input_dts = previous_input_dts,
-                    .previous_input_duration = previous_input_duration,
+                    .dts_offset = dts_offset,
+                    .prev_dts = ctx.prev_dts.items,
+                    .prev_duration = ctx.prev_duration.items,
+                    .mux_dts_offset = mux_dts_offset,
+                    .prev_mux_dts = ctx.prev_mux_dts.items,
+                    .prev_mux_duration = ctx.prev_mux_duration.items,
                     .stream_index = out_stream_index,
                     .input_index = input_idx,
-                    .transcoder = &transcoders[out_stream_index],
+                    .decoder = &ctx.decoders.items[input_idx][out_stream_index],
+                    .encoder = &ctx.encoders.?[out_stream_index],
                 };
             }
         }
@@ -440,7 +745,7 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
                 ret = c.avio_open(&ofmt_ctx.pb, output_file, c.AVIO_FLAG_WRITE);
                 if (ret < 0) {
                     err.print("avio_open", ret);
-                    return error.AVError;
+                    return ret_to_error(ret);
                 }
             }
             // Note: checks for avio_close is above.;
@@ -449,7 +754,7 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
             ret = c.avformat_write_header(ofmt_ctx, &ctx.av_opts);
             if (ret < 0) {
                 err.print("avformat_write_header", ret);
-                return error.AVError;
+                return ret_to_error(ret);
             }
         }
 
@@ -470,26 +775,27 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
             const out_stream_index = @as(usize, @intCast(stream_mapping[in_stream_index]));
             const stream_ctx = ctx.stream_ctxs.items[input_idx][out_stream_index];
 
-            if (opts.to_av1 and stream_ctx.transcoder.enc_ctx != null) {
+            if (opts.to_av1 and stream_ctx.encoder.enc_ctx != null) {
+                try stream_ctx.fix_discontinuity_ts(ctx.pkt);
+
                 // Input to decoder timebase
                 try stream_ctx.transcode_write_frame(ctx.pkt);
             } else {
-                // Remux packet
-                c.av_packet_rescale_ts(ctx.pkt, stream_ctx.in_stream.*.time_base, stream_ctx.out_stream.*.time_base);
+                try stream_ctx.fix_discontinuity_ts(ctx.pkt);
 
-                try stream_ctx.fix_ts(ctx.pkt);
+                c.av_packet_rescale_ts(ctx.pkt, stream_ctx.in_stream.*.time_base, stream_ctx.out_stream.*.time_base);
 
                 ret = c.av_interleaved_write_frame(ofmt_ctx, ctx.pkt);
                 if (ret < 0) {
                     err.print("av_interleaved_write_frame", ret);
-                    return error.AVError;
+                    return ret_to_error(ret);
                 }
             }
         } // while packets.
 
         // Flush encoder
         for (ctx.stream_ctxs.items[input_idx]) |*sc| {
-            if (sc.transcoder.enc_ctx != null) {
+            if (sc.encoder.enc_ctx != null) {
                 try sc.flush_encoder();
             }
         }
@@ -498,138 +804,3 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
     // Write trailer: file is ready and readable.
     _ = c.av_write_trailer(optional_ofmt_ctx);
 }
-
-const StreamContext = struct {
-    in_stream: *c.AVStream,
-    out_stream: *c.AVStream,
-
-    ofmt_ctx: *c.AVFormatContext,
-    transcoder: *Transcoder,
-
-    input_index: usize,
-    stream_index: usize,
-
-    dts_offset: *i64,
-    previous_dts: *i64,
-    previous_duration: *i64,
-    previous_input_dts: ?*i64,
-    previous_input_duration: ?*i64,
-
-    fn transcode_write_frame(self: StreamContext, pkt: *c.AVPacket) !void {
-        // Send packet to decoder
-        var ret = c.avcodec_send_packet(self.transcoder.*.dec_ctx, pkt);
-        if (ret < 0) {
-            err.print("avcodec_send_packet", ret);
-            return error.AVError;
-        }
-
-        while (ret >= 0) {
-            // Fetch decoded frame from decoded packet
-            ret = c.avcodec_receive_frame(self.transcoder.*.dec_ctx, self.transcoder.*.dec_frame);
-            if (ret == c.AVERROR(c.EAGAIN) or ret == c.AVERROR_EOF) {
-                return;
-            } else if (ret < 0) {
-                err.print("avcodec_receive_frame", ret);
-                return error.AVError;
-            }
-            const frame = self.transcoder.*.dec_frame.?;
-            defer c.av_frame_unref(frame);
-
-            frame.*.pts = frame.best_effort_timestamp;
-            try self.encode_write_frame(frame);
-        }
-    }
-
-    fn encode_write_frame(self: StreamContext, dec_frame: ?*c.AVFrame) !void {
-        const pkt = self.transcoder.enc_pkt.?;
-        c.av_packet_unref(pkt);
-
-        if (dec_frame != null and dec_frame.?.*.pts != c.AV_NOPTS_VALUE) {
-            dec_frame.?.*.pts = c.av_rescale_q(dec_frame.?.*.pts, self.transcoder.dec_ctx.?.*.pkt_timebase, self.transcoder.enc_ctx.?.*.time_base);
-        }
-
-        // Send frame to encoder
-        var ret = c.avcodec_send_frame(self.transcoder.enc_ctx, dec_frame);
-        if (ret < 0) {
-            err.print("avcodec_send_frame", ret);
-            return error.AVError;
-        }
-
-        while (ret >= 0) {
-            // Read encoded data from the encoder.
-            ret = c.avcodec_receive_packet(self.transcoder.enc_ctx, pkt);
-            if (ret == c.AVERROR(c.EAGAIN) or ret == c.AVERROR_EOF) {
-                return;
-            } else if (ret < 0) {
-                err.print("avcodec_receive_packet", ret);
-                return error.AVError;
-            }
-
-            // Remux the packet
-            pkt.stream_index = @as(c_int, @intCast(self.stream_index));
-
-            // Encoder to output timebase
-            c.av_packet_rescale_ts(pkt, self.transcoder.enc_ctx.?.*.time_base, self.out_stream.*.time_base);
-
-            try self.fix_ts(pkt);
-
-            // Write packet
-            ret = c.av_interleaved_write_frame(self.ofmt_ctx, pkt);
-            if (ret < 0) {
-                err.print("av_interleaved_write_frame", ret);
-                return error.AVError;
-            }
-        }
-    }
-
-    fn flush_encoder(self: StreamContext) !void {
-        if (self.transcoder.enc_ctx.?.*.codec.*.capabilities & c.AV_CODEC_CAP_DELAY == 0) {
-            return;
-        }
-
-        try self.encode_write_frame(null);
-    }
-
-    fn fix_ts(self: StreamContext, pkt: *c.AVPacket) !void {
-        // Add past offsets.
-        var delta: i64 = self.dts_offset.*;
-
-        if (self.previous_dts.* == c.AV_NOPTS_VALUE) {
-            // Initial discontinuity
-            delta -= pkt.dts;
-
-            // Concatenation
-            if (self.previous_input_dts != null and self.previous_input_dts.?.* != c.AV_NOPTS_VALUE) {
-                delta += self.previous_input_dts.?.* + self.previous_input_duration.?.*;
-
-                std.debug.print("Input {}, stream #{} ({s}) concatenation, last.dts={}, pkt.dts={}, new offset={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.in_stream.*.codecpar.*.codec_type), self.previous_input_dts.?.*, pkt.dts, delta });
-                self.previous_dts.* = self.previous_input_dts.?.*;
-                self.previous_duration.* = self.previous_input_duration.?.*;
-            }
-        }
-
-        // Discontinuity detection
-        // Set the dts_offset for the next iteration.
-        if (self.previous_dts.* != c.AV_NOPTS_VALUE and
-            self.previous_dts.* >= pkt.dts + delta)
-        {
-            // Offset because of discontinuity
-            delta = self.previous_dts.* - pkt.dts;
-            delta += if (self.previous_duration.* > 0) self.previous_duration.* else 1;
-
-            std.debug.print("Input {}, stream #{} ({s}) discontinuity, last.dts={}, pkt.dts={}, new offset={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.in_stream.*.codecpar.*.codec_type), self.previous_dts.*, pkt.dts, delta });
-        }
-
-        // Offsets the current packet
-        pkt.pts += delta;
-        pkt.dts += delta;
-        // std.debug.print("After Input {}, stream #{} ({s}) pkt.pts={}, pkt.dts={}, delta={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.in_stream.*.codecpar.*.codec_type), pkt.pts, pkt.dts, delta });
-
-        // Update the previous decoding timestamp
-        self.previous_dts.* = pkt.dts;
-        self.previous_duration.* = pkt.duration;
-        self.dts_offset.* = delta;
-
-        pkt.pos = -1;
-    }
-};
