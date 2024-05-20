@@ -6,6 +6,7 @@ const c = @cImport({
     @cInclude("libavcodec/avcodec.h");
     @cInclude("libavformat/avformat.h");
     @cInclude("libavutil/avutil.h");
+    @cInclude("libavutil/opt.h");
 });
 
 const AVError = error{
@@ -52,15 +53,22 @@ const Encoder = struct {
             enc_ctx.*.pix_fmt = dec_ctx.*.pix_fmt;
         }
         enc_ctx.*.time_base = c.av_inv_q(dec_ctx.*.framerate);
+        enc_ctx.*.framerate = dec_ctx.*.framerate;
+        std.debug.print("Decoder framerate: {}/{}\n", .{ dec_ctx.*.framerate.num, dec_ctx.*.framerate.den });
+
         // Set lossless encoding
-        enc_ctx.*.properties |= c.AV_CODEC_PROP_LOSSLESS;
+        var ret = c.av_opt_set(enc_ctx.*.priv_data, "crf", "0", 0);
+        if (ret < 0) {
+            err.print("av_opt_set", ret);
+            return ret_to_error(ret);
+        }
 
         if (ofmt_ctx.*.oformat.*.flags & c.AVFMT_GLOBALHEADER != 0) {
             enc_ctx.*.flags |= c.AV_CODEC_FLAG_GLOBAL_HEADER;
         }
 
         // Open encoder
-        const ret = c.avcodec_open2(enc_ctx, enc, null);
+        ret = c.avcodec_open2(enc_ctx, enc, null);
         if (ret < 0) {
             err.print("avcodec_open2", ret);
             return ret_to_error(ret);
@@ -76,7 +84,7 @@ const Encoder = struct {
         return enc_ctx;
     }
 
-    pub fn send_frame(self: *Encoder, frame: ?*c.AVFrame) !void {
+    fn send_frame(self: *Encoder, frame: ?*c.AVFrame) !void {
         const ret = c.avcodec_send_frame(self.enc_ctx.?, frame);
         if (ret < 0) {
             err.print("avcodec_send_frame", ret);
@@ -84,7 +92,7 @@ const Encoder = struct {
         }
     }
 
-    pub fn receive_packet(self: *Encoder) !*c.AVPacket {
+    fn receive_packet(self: *Encoder) !*c.AVPacket {
         const ret = c.avcodec_receive_packet(self.enc_ctx.?, self.enc_pkt.?);
         if (ret < 0) {
             switch (ret) {
@@ -99,11 +107,11 @@ const Encoder = struct {
         return self.enc_pkt.?;
     }
 
-    pub fn unref_pkt(self: *Encoder) void {
+    fn unref_pkt(self: *Encoder) void {
         c.av_packet_unref(self.enc_pkt);
     }
 
-    pub fn deinit(self: *Encoder) void {
+    fn deinit(self: *Encoder) void {
         if (self.enc_ctx != null) {
             c.avcodec_free_context(&self.enc_ctx);
         }
@@ -150,6 +158,7 @@ const Decoder = struct {
                 err.print("couldn't guess framerate", c.AVERROR(c.EINVAL));
                 return AVError.EINVAL;
             }
+            std.debug.print("Guessed framerate: {}/{}\n", .{ dec_ctx.*.framerate.num, dec_ctx.*.framerate.den });
         }
 
         ret = c.avcodec_open2(dec_ctx, dec, null);
@@ -168,7 +177,7 @@ const Decoder = struct {
         return dec_ctx;
     }
 
-    pub fn send_packet(self: *Decoder, pkt: *c.AVPacket) !void {
+    fn send_packet(self: *Decoder, pkt: *c.AVPacket) !void {
         const ret = c.avcodec_send_packet(self.dec_ctx, pkt);
         if (ret < 0) {
             err.print("avcodec_send_packet", ret);
@@ -176,7 +185,7 @@ const Decoder = struct {
         }
     }
 
-    pub fn receive_frame(self: *Decoder) !*c.AVFrame {
+    fn receive_frame(self: *Decoder) !*c.AVFrame {
         const ret = c.avcodec_receive_frame(self.dec_ctx, self.dec_frame.?);
         if (ret < 0) {
             switch (ret) {
@@ -191,7 +200,7 @@ const Decoder = struct {
         return self.dec_frame.?;
     }
 
-    pub fn deinit(self: *Decoder) void {
+    fn deinit(self: *Decoder) void {
         if (self.dec_ctx != null) {
             c.avcodec_free_context(&self.dec_ctx);
         }
@@ -293,7 +302,7 @@ const StreamContext = struct {
                 delta += self.prev_dts[self.input_index - 1][self.stream_index];
                 delta += if (self.prev_duration[self.input_index - 1][self.stream_index] > 0) self.prev_duration[self.input_index - 1][self.stream_index] else 1;
 
-                std.debug.print("Input {}, stream #{} ({s}) concatenation, last.dts={}, pkt.dts={}, new offset={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.in_stream.*.codecpar.*.codec_type), self.prev_dts[self.input_index - 1][self.stream_index], pkt.dts, delta });
+                std.debug.print("Input {}, stream #{} ({s}) concatenation, last.dts={}, pkt.dts={}, new offset={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.out_stream.*.codecpar.*.codec_type), self.prev_dts[self.input_index - 1][self.stream_index], pkt.dts, delta });
                 self.prev_dts[self.input_index][self.stream_index] = self.prev_dts[self.input_index - 1][self.stream_index];
                 self.prev_duration[self.input_index][self.stream_index] = self.prev_duration[self.input_index - 1][self.stream_index];
             }
@@ -309,7 +318,7 @@ const StreamContext = struct {
             delta = self.prev_dts[self.input_index][self.stream_index] - pkt.dts;
             delta += if (self.prev_duration[self.input_index][self.stream_index] > 0) self.prev_duration[self.input_index][self.stream_index] else 1;
 
-            std.debug.print("Input {}, stream #{} ({s}) discontinuity, last.dts={}, pkt.dts={}, new offset={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.in_stream.*.codecpar.*.codec_type), self.prev_dts[self.input_index][self.stream_index], pkt.dts + old_delta, delta });
+            std.debug.print("Input {}, stream #{} ({s}) discontinuity, last.dts={}, pkt.dts={}, new offset={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.out_stream.*.codecpar.*.codec_type), self.prev_dts[self.input_index][self.stream_index], pkt.dts + old_delta, delta });
         }
 
         // Offsets the current packet
@@ -342,7 +351,7 @@ const StreamContext = struct {
             delta = self.prev_mux_dts[self.input_index][self.stream_index] - pkt.dts;
             delta += if (self.prev_mux_duration[self.input_index][self.stream_index] > 0) self.prev_mux_duration[self.input_index][self.stream_index] else 1;
 
-            std.debug.print("Input {}, stream #{} ({s}) non-monotonic, last.dts={}, pkt.dts={}, new offset={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.in_stream.*.codecpar.*.codec_type), self.prev_mux_dts[self.input_index][self.stream_index], pkt.dts, delta });
+            std.debug.print("Input {}, stream #{} ({s}) non-monotonic, last.dts={}, pkt.dts={}, new offset={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.out_stream.*.codecpar.*.codec_type), self.prev_mux_dts[self.input_index][self.stream_index], pkt.dts, delta });
         }
 
         // Offsets the current packet
@@ -671,7 +680,7 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
                                 const enc_ctx = try ctx.encoders.?[out_stream_index].prepare_encoder(ofmt_ctx, ctx.decoders.items[input_idx][out_stream_index].dec_ctx.?);
 
                                 // Copy codec parameters
-                                ret = c.avcodec_parameters_from_context(out_stream.*.codecpar, ctx.encoders.?[out_stream_index].enc_ctx);
+                                ret = c.avcodec_parameters_from_context(out_stream.*.codecpar, enc_ctx);
                                 if (ret < 0) {
                                     err.print("avcodec_parameters_from_context", ret);
                                     return ret_to_error(ret);
@@ -792,14 +801,16 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
                 }
             }
         } // while packets.
+    } // for each input.
 
+    if (opts.to_av1) {
         // Flush encoder
-        for (ctx.stream_ctxs.items[input_idx]) |*sc| {
+        for (ctx.stream_ctxs.items[input_files.len - 1]) |*sc| {
             if (sc.encoder.enc_ctx != null) {
                 try sc.flush_encoder();
             }
         }
-    } // for each input.
+    }
 
     // Write trailer: file is ready and readable.
     _ = c.av_write_trailer(optional_ofmt_ctx);
