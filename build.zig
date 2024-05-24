@@ -15,12 +15,16 @@ pub fn build(b: *std.Build) void {
     });
 
     exe.addIncludePath(.{
-        .path = "src/",
+        .src_path = .{ .owner = b, .sub_path = "src" },
     });
     exe.linkLibC();
     exe.linkSystemLibrary("avcodec");
     exe.linkSystemLibrary("avutil");
     exe.linkSystemLibrary("avformat");
+
+    const zigcli_dep = b.dependency("zig-cli", .{ .target = target });
+    const zigcli_mod = zigcli_dep.module("zig-cli");
+    exe.root_module.addImport("zig-cli", zigcli_mod);
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default

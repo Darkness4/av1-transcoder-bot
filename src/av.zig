@@ -321,6 +321,8 @@ const StreamContext = struct {
             std.debug.print("Input {}, stream #{} ({s}) discontinuity, last.dts={}, pkt.dts={}, new offset={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.out_stream.*.codecpar.*.codec_type), self.prev_dts[self.input_index][self.stream_index], pkt.dts + old_delta, delta });
         }
 
+        // std.debug.print("Input {}, stream #{} ({s}) old.dts={}, old.pts={}, new.dts={}, new.pts={}\n", .{ self.input_index, self.stream_index, c.av_get_media_type_string(self.out_stream.*.codecpar.*.codec_type), pkt.dts, pkt.pts, pkt.dts + delta, pkt.pts + delta });
+
         // Offsets the current packet
         pkt.dts += delta;
         if (pkt.pts != c.AV_NOPTS_VALUE)
@@ -559,7 +561,7 @@ const ConcatContext = struct {
     }
 };
 
-pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: ConcatOptions) !void {
+pub fn concat(output_file: [:0]const u8, input_files: []const [:0]const u8, opts: ConcatOptions) !void {
     c.av_log_set_level(c.AV_LOG_INFO);
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -577,7 +579,7 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
 
     // Open output file
     var optional_ofmt_ctx: ?*c.AVFormatContext = null;
-    var ret = c.avformat_alloc_output_context2(&optional_ofmt_ctx, null, null, output_file);
+    var ret = c.avformat_alloc_output_context2(&optional_ofmt_ctx, null, null, output_file.ptr);
     if (ret < 0) {
         err.print("avformat_alloc_output_context2", ret);
         return ret_to_error(ret);
@@ -594,7 +596,7 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
     for (input_files, 0..input_files.len) |input_file, input_idx| {
         // Open input file
         var optional_ifmt_ctx: ?*c.AVFormatContext = null;
-        ret = c.avformat_open_input(&optional_ifmt_ctx, input_file, null, null);
+        ret = c.avformat_open_input(&optional_ifmt_ctx, input_file.ptr, null, null);
         if (ret < 0) {
             err.print("avformat_open_input", ret);
             return ret_to_error(ret);
@@ -609,7 +611,7 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
             return ret_to_error(ret);
         }
 
-        c.av_dump_format(ifmt_ctx, 0, input_file, 0);
+        c.av_dump_format(ifmt_ctx, 0, input_file.ptr, 0);
 
         // Alloc array of streams
         const stream_mapping_size = ifmt_ctx.nb_streams;
@@ -747,11 +749,11 @@ pub fn concat(output_file: [*:0]const u8, input_files: [][*:0]const u8, opts: Co
 
         // Write header based on the first input file
         if (input_idx == 0) {
-            c.av_dump_format(ofmt_ctx, 0, output_file, 1);
+            c.av_dump_format(ofmt_ctx, 0, output_file.ptr, 1);
 
             // Open output file with avio
             if (ofmt_ctx.oformat.*.flags & c.AVFMT_NOFILE == 0) {
-                ret = c.avio_open(&ofmt_ctx.pb, output_file, c.AVIO_FLAG_WRITE);
+                ret = c.avio_open(&ofmt_ctx.pb, output_file.ptr, c.AVIO_FLAG_WRITE);
                 if (ret < 0) {
                     err.print("avio_open", ret);
                     return ret_to_error(ret);
