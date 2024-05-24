@@ -59,26 +59,13 @@ pub fn main() !void {
     };
 
     return r.run(&app);
-
-    // try av.concat("out.mp4", args.items, .{
-    //     .audio_only = false,
-    //     .to_av1 = false,
-    // });
 }
 
 fn run_concat() !void {
-    const output = try gpa_allocator.dupeZ(u8, config.output);
-    defer gpa_allocator.free(output);
-
-    const inputs = try gpa_allocator.alloc([:0]const u8, config.inputs.len);
-    defer {
-        for (inputs) |input| {
-            gpa_allocator.free(input);
-        }
-        gpa_allocator.free(inputs);
-    }
+    const output = try arena_allocator.dupeZ(u8, config.output);
+    const inputs = try arena_allocator.alloc([:0]const u8, config.inputs.len);
     for (config.inputs, 0..config.inputs.len) |input, i| {
-        const input_dup = try gpa_allocator.dupeZ(u8, input);
+        const input_dup = try arena_allocator.dupeZ(u8, input);
 
         inputs[i] = input_dup;
     }
