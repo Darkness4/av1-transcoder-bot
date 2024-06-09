@@ -177,7 +177,7 @@ const Decoder = struct {
         return dec_ctx;
     }
 
-    fn send_packet(self: *Decoder, pkt: *c.AVPacket) !void {
+    fn send_packet(self: *Decoder, pkt: ?*c.AVPacket) !void {
         const ret = c.avcodec_send_packet(self.dec_ctx, pkt);
         if (ret < 0) {
             err.print("avcodec_send_packet", ret);
@@ -229,7 +229,7 @@ const StreamContext = struct {
     prev_mux_dts: [][]i64,
     prev_mux_duration: [][]i64,
 
-    fn transcode_write_frame(self: StreamContext, pkt: *c.AVPacket) !void {
+    fn transcode_write_frame(self: StreamContext, pkt: ?*c.AVPacket) !void {
         // Send packet to decoder
         try self.decoder.send_packet(pkt);
 
@@ -242,17 +242,18 @@ const StreamContext = struct {
             };
             defer c.av_frame_unref(frame);
 
-            frame.*.pts = frame.best_effort_timestamp;
+            frame.*.pts = frame.*.best_effort_timestamp;
+
+            if (frame.*.pts != c.AV_NOPTS_VALUE) {
+                frame.*.pts = c.av_rescale_q(frame.*.pts, self.decoder.dec_ctx.?.*.pkt_timebase, self.encoder.enc_ctx.?.*.time_base);
+            }
+
             try self.encode_write_frame(frame);
         }
     }
 
     fn encode_write_frame(self: StreamContext, dec_frame: ?*c.AVFrame) !void {
         self.encoder.unref_pkt();
-
-        if (dec_frame != null and dec_frame.?.*.pts != c.AV_NOPTS_VALUE) {
-            dec_frame.?.*.pts = c.av_rescale_q(dec_frame.?.*.pts, self.decoder.dec_ctx.?.*.pkt_timebase, self.encoder.enc_ctx.?.*.time_base);
-        }
 
         try self.encoder.send_frame(dec_frame);
 
@@ -287,6 +288,14 @@ const StreamContext = struct {
         }
 
         try self.encode_write_frame(null);
+    }
+
+    fn flush_decoder(self: StreamContext) !void {
+        if (self.decoder.dec_ctx.?.*.codec.*.capabilities & c.AV_CODEC_CAP_DELAY == 0) {
+            return;
+        }
+
+        try self.transcode_write_frame(null);
     }
 
     fn fix_discontinuity_ts(self: StreamContext, pkt: *c.AVPacket) !void {
@@ -664,7 +673,7 @@ pub fn concat(output_file: [:0]const u8, input_files: []const [:0]const u8, opts
                 std.debug.print("Input {}, mapping stream {} ({s}) to output stream {}\n", .{ input_idx, i, c.av_get_media_type_string(in_codecpar.*.codec_type), out_stream_index });
 
                 // Prepare decoder context if using AV1 transcoding
-                if (opts.to_av1 and in_codecpar.*.codec_type == c.AVMEDIA_TYPE_VIDEO) {
+                if (opts.to_av1 and in_codecpar.*.codec_type == c.AVMEDIA_TYPE_VIDEO and in_codecpar.*.codec_id != c.AV_CODEC_ID_AV1) {
                     _ = try ctx.decoders.items[input_idx][out_stream_index].prepare_decoder(ifmt_ctx, in_stream);
                 }
 
@@ -759,7 +768,7 @@ pub fn concat(output_file: [:0]const u8, input_files: []const [:0]const u8, opts
                     return ret_to_error(ret);
                 }
             }
-            // Note: checks for avio_close is above.;
+            // Note: checks for avio_close is above.
 
             // Write header
             ret = c.avformat_write_header(ofmt_ctx, &ctx.av_opts);
@@ -784,6 +793,8 @@ pub fn concat(output_file: [:0]const u8, input_files: []const [:0]const u8, opts
                 continue;
             }
             const out_stream_index = @as(usize, @intCast(stream_mapping[in_stream_index]));
+            ctx.pkt.stream_index = @as(c_int, @intCast(out_stream_index));
+
             const stream_ctx = ctx.stream_ctxs.items[input_idx][out_stream_index];
 
             if (opts.to_av1 and stream_ctx.encoder.enc_ctx != null) {
@@ -806,8 +817,11 @@ pub fn concat(output_file: [:0]const u8, input_files: []const [:0]const u8, opts
     } // for each input.
 
     if (opts.to_av1) {
-        // Flush encoder
+        // Flush decoders and encoders
         for (ctx.stream_ctxs.items[input_files.len - 1]) |*sc| {
+            if (sc.decoder.dec_ctx != null) {
+                try sc.flush_decoder();
+            }
             if (sc.encoder.enc_ctx != null) {
                 try sc.flush_encoder();
             }

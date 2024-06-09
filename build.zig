@@ -12,15 +12,16 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
 
     exe.addIncludePath(.{
         .src_path = .{ .owner = b, .sub_path = "src" },
     });
-    exe.linkLibC();
-    exe.linkSystemLibrary("avcodec");
-    exe.linkSystemLibrary("avutil");
-    exe.linkSystemLibrary("avformat");
+    exe.linkSystemLibrary2("avcodec", .{ .preferred_link_mode = .static });
+    exe.linkSystemLibrary2("avutil", .{ .preferred_link_mode = .static });
+    exe.linkSystemLibrary2("avformat", .{ .preferred_link_mode = .static });
+    exe.linkSystemLibrary2("swresample", .{ .preferred_link_mode = .static });
 
     const zigcli_dep = b.dependency("zig-cli", .{ .target = target });
     const zigcli_mod = zigcli_dep.module("zig-cli");
