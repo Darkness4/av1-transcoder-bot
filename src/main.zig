@@ -75,3 +75,8 @@ fn run_concat() !void {
         .to_av1 = config.to_av1,
     });
 }
+
+const my_struct = struct {
+    a: u8,
+    b: u8,
+};

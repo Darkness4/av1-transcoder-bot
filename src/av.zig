@@ -36,12 +36,12 @@ const Encoder = struct {
             std.debug.print("couldn't find encoder\n", .{});
             return AVError.Unknown;
         }
-        const enc_ctx = c.avcodec_alloc_context3(enc);
+        var enc_ctx = c.avcodec_alloc_context3(enc);
         if (enc_ctx == null) {
             err.print("avcodec_alloc_context3", c.AVERROR(c.ENOMEM));
             return AVError.ENOMEM;
         }
-        errdefer c.avcodec_free_context(@constCast(@ptrCast(&enc_ctx)));
+        errdefer c.avcodec_free_context(&enc_ctx);
 
         // Copy codec format
         enc_ctx.*.width = dec_ctx.*.width;
@@ -136,12 +136,12 @@ const Decoder = struct {
             std.debug.print("couldn't find decoder\n", .{});
             return AVError.Unknown;
         }
-        const dec_ctx = c.avcodec_alloc_context3(dec);
+        var dec_ctx = c.avcodec_alloc_context3(dec);
         if (dec_ctx == null) {
             err.print("avcodec_alloc_context3", c.AVERROR(c.ENOMEM));
             return AVError.ENOMEM;
         }
-        errdefer c.avcodec_free_context(@constCast(@ptrCast(&dec_ctx)));
+        errdefer c.avcodec_free_context(&dec_ctx);
         var ret = c.avcodec_parameters_to_context(dec_ctx, in_stream.*.codecpar);
         if (ret < 0) {
             err.print("avcodec_parameters_to_context", ret);
@@ -803,9 +803,9 @@ pub fn concat(output_file: [:0]const u8, input_files: []const [:0]const u8, opts
                 // Input to decoder timebase
                 try stream_ctx.transcode_write_frame(ctx.pkt);
             } else {
-                try stream_ctx.fix_discontinuity_ts(ctx.pkt);
-
                 c.av_packet_rescale_ts(ctx.pkt, stream_ctx.in_stream.*.time_base, stream_ctx.out_stream.*.time_base);
+
+                try stream_ctx.fix_discontinuity_ts(ctx.pkt);
 
                 ret = c.av_interleaved_write_frame(ofmt_ctx, ctx.pkt);
                 if (ret < 0) {
@@ -830,4 +830,42 @@ pub fn concat(output_file: [:0]const u8, input_files: []const [:0]const u8, opts
 
     // Write trailer: file is ready and readable.
     _ = c.av_write_trailer(optional_ofmt_ctx);
+}
+
+fn print_avcodecpar(codecpar: *c.AVCodecParameters) void {
+    std.debug.print("Codec type: {s}\n", .{c.av_get_media_type_string(codecpar.*.codec_type)});
+    std.debug.print("Codec: {s}\n", .{c.avcodec_get_name(codecpar.*.codec_id)});
+    std.debug.print("Codec tag: {}\n", .{codecpar.*.codec_tag});
+
+    for (0..@as(usize, @intCast(codecpar.*.extradata_size))) |i| {
+        std.debug.print("Codec extra data: {}\n", .{codecpar.*.extradata[i]});
+    }
+    std.debug.print("Format: {}\n", .{codecpar.*.format});
+    std.debug.print("Bit rate: {}\n", .{codecpar.*.bit_rate});
+    std.debug.print("Profile: {}\n", .{codecpar.*.profile});
+    std.debug.print("Level: {}\n", .{codecpar.*.level});
+    std.debug.print("Width: {}\n", .{codecpar.*.width});
+    std.debug.print("Height: {}\n", .{codecpar.*.height});
+    std.debug.print("Sample aspect ratio: {}/{}\n", .{ codecpar.*.sample_aspect_ratio.num, codecpar.*.sample_aspect_ratio.den });
+    std.debug.print("Field order: {}\n", .{codecpar.*.field_order});
+    std.debug.print("Color range: {}\n", .{codecpar.*.color_range});
+    std.debug.print("Color primaries: {}\n", .{codecpar.*.color_primaries});
+    std.debug.print("Color transfer: {}\n", .{codecpar.*.color_trc});
+    std.debug.print("Color space: {}\n", .{codecpar.*.color_space});
+    std.debug.print("Chroma location: {}\n", .{codecpar.*.chroma_location});
+    std.debug.print("Video delay: {}\n", .{codecpar.*.video_delay});
+    std.debug.print("Channel layout: {}\n", .{codecpar.*.channel_layout});
+    std.debug.print("Channels: {}\n", .{codecpar.*.channels});
+    std.debug.print("Sample rate: {}\n", .{codecpar.*.sample_rate});
+    std.debug.print("Block align: {}\n", .{codecpar.*.block_align});
+    std.debug.print("Frame size: {}\n", .{codecpar.*.frame_size});
+    std.debug.print("Initial padding: {}\n", .{codecpar.*.initial_padding});
+    std.debug.print("Trailing padding: {}\n", .{codecpar.*.trailing_padding});
+    std.debug.print("Seek preroll: {}\n", .{codecpar.*.seek_preroll});
+    std.debug.print("Channel layout(order={}, nb_channels={})\n", .{ codecpar.*.ch_layout.order, codecpar.*.ch_layout.nb_channels });
+    std.debug.print("Frame rate: {}/{}\n", .{ codecpar.*.framerate.num, codecpar.*.framerate.den });
+
+    for (0..@as(usize, @intCast(codecpar.*.nb_coded_side_data))) |i| {
+        std.debug.print("Coded Side data: {}\n", .{codecpar.*.coded_side_data[i]});
+    }
 }

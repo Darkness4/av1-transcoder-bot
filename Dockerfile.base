@@ -1,0 +1,18 @@
+FROM --platform=linux/amd64 docker.io/gentoo/stage3:musl as builder
+
+RUN PORTAGE_RSYNC_EXTRA_OPTS="-q" emerge --sync
+
+RUN --mount=type=cache,target=/var/tmp/portage MAKEOPTS="-j$(nproc)" emerge "dev-vcs/git"
+
+COPY --chown=portage:portage ./docker/overlay /var/db/repos/local
+COPY --chown=root:root \
+  ./docker/portage/repos.conf \
+  ./docker/portage/package.use \
+  ./docker/portage/package.accept_keywords \
+  /etc/portage/
+
+RUN --mount=type=cache,target=/var/tmp/portage MAKEOPTS="-j$(nproc)" emerge -1 sys-devel/clang sys-devel/lld sys-devel/llvm "=dev-lang/zig-9999"
+
+# Use a new layer to cache zig which is a slow build and may not change often.
+RUN --mount=type=cache,target=/var/tmp/portage MAKEOPTS="-j$(nproc)" emerge "media-libs/svt-av1::local" "media-video/ffmpeg"
+

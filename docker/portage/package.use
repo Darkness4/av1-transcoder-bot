@@ -1,0 +1,2 @@
+media-libs/svt-av1 static-libs
+media-video/ffmpeg static-libs svt-av1 -dav1d -x264 -x265 -amrenc -kvazaar -mp3 -rav1e -snappy -theora -twolame -webp -xvid -xvid encode -network -gpl -postproc -zlib -gnutls -bzip2 -opus FFTOOLS: -*
