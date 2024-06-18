@@ -58,10 +58,9 @@ fn buildDynamicExecutable(b: *std.Build, target: std.Build.ResolvedTarget, optim
     exe.addIncludePath(.{
         .src_path = .{ .owner = b, .sub_path = "src" },
     });
-    exe.linkSystemLibrary2("libavcodec", .{ .preferred_link_mode = .dynamic });
-    exe.linkSystemLibrary2("libavutil", .{ .preferred_link_mode = .dynamic });
-    exe.linkSystemLibrary2("libavformat", .{ .preferred_link_mode = .dynamic });
-    exe.linkSystemLibrary2("swresample", .{ .preferred_link_mode = .dynamic });
+    exe.linkSystemLibrary2("libavcodec", .{ .preferred_link_mode = .dynamic, .use_pkg_config = .force });
+    exe.linkSystemLibrary2("libavutil", .{ .preferred_link_mode = .dynamic, .use_pkg_config = .force });
+    exe.linkSystemLibrary2("libavformat", .{ .preferred_link_mode = .dynamic, .use_pkg_config = .force });
 
     // No need to explicitly link to the SVT-AV1 libraries, as they are linked to the libavcodec library.
 
