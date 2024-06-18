@@ -1,0 +1,80 @@
+name: Zig CI
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - '*'
+    branches:
+      - 'main'
+    paths:
+      - '**.zig'
+      - '**.c'
+      - '**.h'
+      - 'Dockerfile*'
+      - '.github/workflows/main.yaml'
+  pull_request:
+    branches:
+      - 'main'
+
+jobs:
+  build-static:
+    name: Build static av1-transcoder
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Context for Buildx
+        run: |
+          docker context create builders
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: latest
+          endpoint: builders
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get the oci compatible version
+        if: startsWith(github.ref, 'refs/tags')
+        id: get_version
+        run: |
+          echo "VERSION=$(echo ${GITHUB_REF#refs/*/})" >> $GITHUB_OUTPUT
+          echo "OCI_VERSION=$(echo ${GITHUB_REF#refs/*/} | sed 's/+/-/g' | sed -E 's/v(.*)/\1/g' )" >> $GITHUB_OUTPUT
+
+      - name: Build and export dev
+        uses: docker/build-push-action@v5
+        with:
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            VERSION=dev
+          tags: |
+            ghcr.io/darkness4/av1-transcoder:dev
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and export
+        if: startsWith(github.ref, 'refs/tags')
+        uses: docker/build-push-action@v5
+        with:
+          file: Dockerfile.static
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            VERSION=${{ steps.get_version.outputs.VERSION }}
+          tags: |
+            ghcr.io/darkness4/av1-transcoder:latest
+            ghcr.io/darkness4/av1-transcoder:${{ steps.get_version.outputs.OCI_VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

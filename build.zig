@@ -13,6 +13,7 @@ pub fn buildStaticExecutable(b: *std.Build, target: std.Build.ResolvedTarget, op
     exe.addIncludePath(.{
         .src_path = .{ .owner = b, .sub_path = "src" },
     });
+    // TODO: call pkg-config to resolve these paths. Needed for cross-compilation.
     exe.addIncludePath(.{
         .src_path = .{ .owner = b, .sub_path = "/usr/include" },
     });
